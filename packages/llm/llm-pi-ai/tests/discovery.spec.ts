@@ -128,6 +128,34 @@ describe('draft-provider model discovery', () => {
     expect(server.headers[0]?.['user-agent']).toBe(userAgent())
   })
 
+  it('keeps llama.cpp multimodal capabilities and context metadata', async () => {
+    const server = await listingServer({
+      body: JSON.stringify({
+        data: [
+          {
+            id: 'qwen-vision',
+            capabilities: ['completion', 'multimodal'],
+            meta: { n_ctx: 131_072 },
+          },
+          {
+            id: 'qwen-text',
+            capabilities: ['completion'],
+            meta: { n_ctx: 32_768 },
+          },
+        ],
+      }),
+    })
+    const ctx = await harness()
+
+    const models = await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/v1` })
+
+    expect(models).toEqual([
+      { id: 'qwen-vision', contextWindow: 131_072, inputModalities: ['text', 'image'] },
+      { id: 'qwen-text', contextWindow: 32_768 },
+    ])
+    expect(server.paths).toEqual(['/v1/models'])
+  })
+
   it('keeps a deployment path instead of resolving it away', async () => {
     const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
     const ctx = await harness()

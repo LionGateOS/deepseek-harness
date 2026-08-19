@@ -488,6 +488,37 @@ describe('endpoint interrogation', () => {
     ])
   })
 
+  it('adopts discovered input modalities as pi-ai model input', async () => {
+    const discover = vi.fn(() => Promise.resolve(ok({
+      models: [{
+        id: 'qwen-vision',
+        name: 'Qwen Vision',
+        contextWindow: 131_072,
+        inputModalities: ['text', 'image'],
+      }],
+    })))
+    const { mutate } = await mountSection({
+      discover,
+      providers: { openai: { baseURL: 'https://proxy.example/v1', models: [] } },
+    })
+    openEditor('openai')
+
+    fireEvent.click(screen.getByText(en.fetchModels))
+    await screen.findByText(en.fetchTitle)
+    fireEvent.click(screen.getByText(en.fetchAdopt))
+
+    fireEvent.click(screen.getByText(en.apply))
+    await waitFor(() => { expect(mutate).toHaveBeenCalled() })
+    expect(firstMutate(mutate).ops[0]?.value).toEqual([
+      {
+        id: 'qwen-vision',
+        name: 'Qwen Vision',
+        contextWindow: 131_072,
+        input: ['text', 'image'],
+      },
+    ])
+  })
+
   it('keeps the rows editable when the provider cannot be interrogated', async () => {
     const discover = vi.fn(() => Promise.resolve(
       fail('https://proxy.example/v1/models answered 401; check the API key', 'model-discovery-failed'),

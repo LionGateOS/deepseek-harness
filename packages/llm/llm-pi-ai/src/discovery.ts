@@ -23,7 +23,7 @@
  */
 
 import { INVALID_CREDENTIAL_CODE, LlmError, normalizeApiKey } from '@deepseek-ai/dsh-llm'
-import type { LlmDiscoveredModel, LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm'
+import type { LlmDiscoveredModel, LlmModelDiscoveryRequest, ModelModality } from '@deepseek-ai/dsh-llm'
 import { attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { catalogModels } from './catalog.ts'
 
@@ -59,6 +59,9 @@ interface ListingEntry {
   context_length?: unknown
   max_tokens?: unknown
   max_output_tokens?: unknown
+  /** llama.cpp and other gateway extensions; absent from official listings. */
+  capabilities?: unknown
+  meta?: unknown
 }
 
 /** A positive integer field of a listing entry, or `undefined` when absent or unusable. */
@@ -75,6 +78,23 @@ function label(...candidates: readonly unknown[]): string | undefined {
     if (typeof candidate === 'string' && candidate.length > 0) return candidate
   }
   return undefined
+}
+
+/** A field from an object-valued gateway extension, or `undefined` when absent. */
+function objectField(raw: unknown, key: string): unknown {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  return (raw as Record<string, unknown>)[key]
+}
+
+/** Accepted request modalities disclosed by gateway-specific capability extensions. */
+function discoveredModalities(entry: ListingEntry | null): readonly ModelModality[] | undefined {
+  if (!Array.isArray(entry?.capabilities)) return undefined
+  const capabilities = new Set(
+    entry.capabilities
+      .filter((capability): capability is string => typeof capability === 'string')
+      .map(capability => capability.toLowerCase()),
+  )
+  return capabilities.has('multimodal') ? ['text', 'image'] : undefined
 }
 
 /**
@@ -149,13 +169,15 @@ function readListing(body: unknown): LlmDiscoveredModel[] {
     const id = label(entry?.id)
     if (id === undefined) continue
     const name = label(entry?.name, entry?.display_name)
-    const contextWindow = capacity(entry?.context_window, entry?.context_length)
+    const contextWindow = capacity(entry?.context_window, entry?.context_length, objectField(entry?.meta, 'n_ctx'))
     const maxTokens = capacity(entry?.max_output_tokens, entry?.max_tokens)
+    const inputModalities = discoveredModalities(entry)
     models.push({
       id,
       ...name === undefined ? {} : { name },
       ...contextWindow === undefined ? {} : { contextWindow },
       ...maxTokens === undefined ? {} : { maxTokens },
+      ...inputModalities === undefined ? {} : { inputModalities },
     })
   }
   return models
