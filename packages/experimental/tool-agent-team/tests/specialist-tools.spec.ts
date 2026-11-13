@@ -19,6 +19,7 @@ import { mountWorkingDirectoryFixture } from '../../../subagent/subagent/tests/w
 import TeamService from '../../agent-team/src/index.ts'
 import type { SpecialistDefinition } from '../../agent-team/src/types.ts'
 import * as toolTeam from '../src/index.ts'
+import { recordOrchestrationMode } from '../src/orchestration-mode.ts'
 
 const SIGNAL = new AbortController().signal
 const roots: string[] = []
@@ -217,6 +218,7 @@ describe('spawn_specialist', () => {
 describe('specialist scheduling proof: 8 catalog / 6 selected / maxActive=2', () => {
   it('dispatches exactly 2 immediately active and 4 queued across 6 spawn_specialist calls', async () => {
     const { ctx, lead } = await setup(EIGHT_SPECIALISTS, 2)
+    recordOrchestrationMode(lead.session, 'off')
 
     // Track each call's resolution order
     let activeCount = 0
@@ -262,6 +264,114 @@ describe('specialist scheduling proof: 8 catalog / 6 selected / maxActive=2', ()
     expect(active).toHaveLength(2)
     expect(queued).toHaveLength(4)
     expect(startSpy).toHaveBeenCalledTimes(6)
+  })
+})
+
+describe('automatic specialist continuation gate', () => {
+  it('requires a checkpoint after four AUTO starts', async () => {
+    const { ctx, lead } = await setup(EIGHT_SPECIALISTS, 4)
+    vi.spyOn(ctx.agentTeams, 'startSpecialist').mockImplementation(async (_agent, req) => ({
+      status: 'queued' as const, name: req.name, pending: 1,
+    }))
+    for (const specialist of EIGHT_SPECIALISTS.slice(0, 4)) {
+      const result = await execute(ctx, lead, 'spawn_specialist', { name: specialist.name, task: `Handle ${specialist.name}.` })
+      expect(result.isError, text(result)).toBe(false)
+    }
+    const blocked = await execute(ctx, lead, 'spawn_specialist', { name: EIGHT_SPECIALISTS[4]!.name, task: 'Needs checkpoint.' })
+    expect(blocked.isError).toBe(true)
+    expect(text(blocked)).toContain('wave 1 reached the four-specialist limit')
+  })
+
+  it('refuses a checkpoint until queued or working specialists have settled', async () => {
+    const { ctx, lead } = await setup(EIGHT_SPECIALISTS, 4)
+    vi.spyOn(ctx.agentTeams, 'startSpecialist').mockImplementation(async (_agent, req) => ({
+      status: 'queued' as const, name: req.name, pending: 1,
+    }))
+    const status = vi.spyOn(ctx.agentTeams, 'listSpecialistStatus').mockReturnValue({
+      specialists: [
+        { name: 'requirements-analyst', phase: 'working', provider: 'spawn' },
+        { name: 'code-reviewer', phase: 'queued', position: 0, provider: 'spawn' },
+      ],
+    })
+
+    expect((await execute(ctx, lead, 'spawn_specialist', {
+      name: 'requirements-analyst',
+      task: 'Inspect the boundary.',
+    })).isError).toBe(false)
+
+    const blocked = await execute(ctx, lead, 'specialist_checkpoint', {
+      decision: 'continue',
+      evidence: 'Partial findings exist but the wave is still active.',
+    })
+    expect(blocked.isError).toBe(true)
+    expect(text(blocked)).toContain('wave 1 is not settled')
+    expect(text(blocked)).toContain('requirements-analyst:working')
+    expect(text(blocked)).toContain('code-reviewer:queued')
+
+    status.mockReturnValue({
+      specialists: [
+        { name: 'requirements-analyst', phase: 'finished', provider: 'spawn' },
+        { name: 'code-reviewer', phase: 'cancelled', provider: 'spawn' },
+      ],
+    })
+    const accepted = await execute(ctx, lead, 'specialist_checkpoint', {
+      decision: 'continue',
+      evidence: 'The wave settled and exposed an unresolved integration boundary.',
+    })
+    expect(accepted.isError, text(accepted)).toBe(false)
+    expect(JSON.parse(text(accepted))).toEqual({ decision: 'continue', wave: 1, nextWave: 2 })
+  })
+
+  it('opens one evidence-gated follow-up wave and never a third', async () => {
+    const { ctx, lead } = await setup(EIGHT_SPECIALISTS, 4)
+    vi.spyOn(ctx.agentTeams, 'startSpecialist').mockImplementation(async (_agent, req) => ({
+      status: 'queued' as const, name: req.name, pending: 1,
+    }))
+    expect((await execute(ctx, lead, 'spawn_specialist', { name: EIGHT_SPECIALISTS[0]!.name, task: 'Inspect risk.' })).isError).toBe(false)
+    expect((await execute(ctx, lead, 'specialist_checkpoint', { decision: 'continue', evidence: '   ' })).isError).toBe(true)
+    const checkpoint = await execute(ctx, lead, 'specialist_checkpoint', {
+      decision: 'continue',
+      evidence: 'Wave 1 found an unresolved integration boundary requiring independent verification.',
+    })
+    expect(checkpoint.isError, text(checkpoint)).toBe(false)
+    expect(JSON.parse(text(checkpoint))).toEqual({ decision: 'continue', wave: 1, nextWave: 2 })
+    expect((await execute(ctx, lead, 'spawn_specialist', { name: EIGHT_SPECIALISTS[1]!.name, task: 'Verify boundary.' })).isError).toBe(false)
+    const third = await execute(ctx, lead, 'specialist_checkpoint', {
+      decision: 'continue',
+      evidence: 'Wave 2 found another question.',
+    })
+    expect(third.isError).toBe(true)
+    expect(text(third)).toContain('third automatic specialist wave')
+  })
+
+  it('closes automatic delegation when the Lead chooses synthesis', async () => {
+    const { ctx, lead } = await setup(EIGHT_SPECIALISTS, 4)
+    vi.spyOn(ctx.agentTeams, 'startSpecialist').mockImplementation(async (_agent, req) => ({
+      status: 'queued' as const, name: req.name, pending: 1,
+    }))
+    expect((await execute(ctx, lead, 'spawn_specialist', { name: EIGHT_SPECIALISTS[0]!.name, task: 'Review.' })).isError).toBe(false)
+    expect((await execute(ctx, lead, 'specialist_checkpoint', {
+      decision: 'synthesize',
+      evidence: 'Review complete; no unresolved issue justifies another wave.',
+    })).isError).toBe(false)
+    const blocked = await execute(ctx, lead, 'spawn_specialist', { name: EIGHT_SPECIALISTS[1]!.name, task: 'Do not start.' })
+    expect(blocked.isError).toBe(true)
+    expect(text(blocked)).toContain('continuation is closed')
+  })
+
+  it('keeps OFF manual delegation outside the automatic wave budget', async () => {
+    const { ctx, lead } = await setup(EIGHT_SPECIALISTS, 2)
+    recordOrchestrationMode(lead.session, 'off')
+    vi.spyOn(ctx.agentTeams, 'startSpecialist').mockImplementation(async (_agent, req) => ({
+      status: 'queued' as const, name: req.name, pending: 1,
+    }))
+    for (const specialist of EIGHT_SPECIALISTS.slice(0, 6)) {
+      const result = await execute(ctx, lead, 'spawn_specialist', { name: specialist.name, task: `Manual ${specialist.name}.` })
+      expect(result.isError, text(result)).toBe(false)
+    }
+    const checkpoint = await execute(ctx, lead, 'specialist_checkpoint', { decision: 'continue', evidence: 'not applicable' })
+    expect(checkpoint.isError).toBe(true)
+    expect(text(checkpoint)).toContain('OFF is owner-explicit manual delegation')
   })
 })
 

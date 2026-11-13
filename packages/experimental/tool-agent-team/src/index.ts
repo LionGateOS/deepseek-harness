@@ -28,6 +28,14 @@ import {
   recordOrchestrationMode,
 } from './orchestration-mode.ts'
 import type { OrchestrationMode } from './orchestration-mode.ts'
+import {
+  assertAutomaticSpecialistStart,
+  recordAutomaticSpecialistStart,
+  recordSpecialistCheckpoint,
+  specialistContinuationProjectionDefinition,
+  specialistContinuationStateOf,
+  specialistContinuationTurnKey,
+} from './continuation-gate.ts'
 
 /** Cordis plugin name. */
 export const name = 'tool-agent-team'
@@ -71,6 +79,8 @@ As Team Lead you own the outcome. Decompose the task, choose the specialist that
 
 ${MODE_GUIDANCE[mode]}
 
+In AUTO and ON, automatic specialists are bounded to at most four starts in wave 1 and at most four starts in one optional follow-up wave. Before opening the follow-up wave, wait until every queued or working specialist has settled, then call specialist_checkpoint after reviewing wave-1 findings, provide concrete evidence from those findings, and choose continue only when unresolved risk, conflicting evidence, failed verification, or a newly discovered subsystem justifies more specialist work. Choosing synthesize closes automatic specialist delegation for the current human turn. Wave 2 is final: there is no third automatic wave. Automatic AUTO/ON delegation uses spawn_specialist; spawn_teammate remains the direct manual Team primitive and must not be used as an automatic bypass around this continuation gate. OFF remains owner-explicit manual delegation and does not use this automatic wave budget.
+
 The orchestration mode changes delegation preference only. It cannot widen filesystem permissions, model-selection permission, paid or cloud routes, concurrency limits, specialist role contracts, or session and tool permissions, and it never authorizes recursive delegation.
 
 The Team Lead and all teammates share the same working directory and filesystem. Edits are immediately visible to every member. Split write work into disjoint scopes, record expected write scopes on shared tasks, and use task dependencies when work must be ordered. Write-scope overlap is advisory, not a lock.
@@ -82,6 +92,20 @@ Use the target returned by spawn_teammate or list_agents for send_message${inter
 
 const ACTIVE_WAIT_STATUSES: ReadonlySet<TeamMemberView['status']> = new Set(['running', 'provisioning'])
 const NO_ACTIVE_PEER_MESSAGE = 'No other Team member is running or provisioning. wait_agent cannot make progress or wake inactive teammates. Re-list with list_agents and team_task_list, then use send_message to wake each required inactive teammate before waiting again.'
+
+const continuationTails = new Map<string, Promise<void>>()
+
+async function serializeContinuation<T>(teamKey: string, operation: () => Promise<T>): Promise<T> {
+  const prior = continuationTails.get(teamKey) ?? Promise.resolve()
+  const run = prior.then(operation, operation)
+  const tail = run.then(() => undefined, () => undefined)
+  continuationTails.set(teamKey, tail)
+  try {
+    return await run
+  } finally {
+    if (continuationTails.get(teamKey) === tail) continuationTails.delete(teamKey)
+  }
+}
 
 /**
  * One model-facing roster row. The Lead pseudo-row omits the
@@ -150,6 +174,16 @@ const SPECIALIST_STATUS_VALUE_SCHEMA = {
       position: { type: 'integer' },
       provider: { type: 'string' },
     },
+  },
+} as const
+
+const SPECIALIST_CHECKPOINT_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    decision: { type: 'string', required: true, enum: ['continue', 'synthesize'] },
+    wave: { type: 'integer', required: true },
+    nextWave: { type: 'integer' },
   },
 } as const
 
@@ -653,6 +687,57 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
     })))
 
     register(scoped.tools.register(defineTool({
+      name: 'specialist_checkpoint',
+      description: 'Record the Lead evidence checkpoint after a settled automatic specialist wave. In AUTO/ON, choose continue to open the one allowed follow-up wave, or synthesize to close automatic specialist delegation for this human turn. Only the Team Lead may call this tool.',
+      parameters: {
+        decision: {
+          type: 'string',
+          required: true,
+          enum: ['continue', 'synthesize'],
+          description: 'continue opens wave 2 after wave 1; synthesize closes automatic specialist delegation for this human turn.',
+        },
+        evidence: {
+          type: 'string',
+          required: true,
+          description: 'Concrete findings already obtained from the settled wave that justify the decision. Must be non-empty.',
+        },
+      },
+      output: jsonOutput(SPECIALIST_CHECKPOINT_VALUE_SCHEMA),
+      async execute(args, exec) {
+        const agent = callingAgent(exec.agent, 'specialist_checkpoint')
+        return await serializeContinuation(String(teamSession.id), async () => {
+          const membership = ctx.agentTeams.tryMembership(agent)
+          if (membership?.role !== 'lead') throw new Error('specialist_checkpoint requires the Team Lead')
+          const mode = orchestrationModeOf(ctx.sessionProjections, teamSession)
+          if (mode === 'off') {
+            throw new Error('specialist_checkpoint applies only to automatic AUTO/ON orchestration; OFF is owner-explicit manual delegation')
+          }
+          const evidence = args.evidence.trim()
+          if (evidence.length === 0) throw new Error('specialist checkpoint evidence must be non-empty')
+          if (evidence.length > 8_000) throw new Error('specialist checkpoint evidence exceeds 8000 characters')
+          const turnKey = specialistContinuationTurnKey(teamSession)
+          const state = specialistContinuationStateOf(ctx.sessionProjections, teamSession, turnKey)
+          if (state.startedInWave === 0) throw new Error(`specialist wave ${state.wave} has no recorded starts to checkpoint`)
+          const unsettled = ctx.agentTeams.listSpecialistStatus(agent).specialists
+            .filter(specialist => specialist.phase === 'queued' || specialist.phase === 'working')
+          if (unsettled.length > 0) {
+            const summary = unsettled.map(specialist => `${specialist.name}:${specialist.phase}`).join(', ')
+            throw new Error(`specialist wave ${state.wave} is not settled; wait for queued/working specialists before checkpointing: ${summary}`)
+          }
+          if (args.decision === 'continue' && state.wave !== 1) {
+            throw new Error('a third automatic specialist wave is not allowed; synthesize the Lead answer')
+          }
+          recordSpecialistCheckpoint(teamSession, turnKey, state.wave, args.decision, evidence)
+          return {
+            decision: args.decision,
+            wave: state.wave,
+            ...(args.decision === 'continue' ? { nextWave: 2 } : {}),
+          }
+        })
+      },
+    })))
+
+    register(scoped.tools.register(defineTool({
       name: 'spawn_specialist',
       description: 'Start one specialist from the catalog and give it a concrete assignment. `name` selects the specialist role; `task` is the work that specialist must perform. The specialist keeps its catalog role and receives `task` as its assignment. If the per-team concurrency limit is reached the specialist is queued and starts automatically when a slot opens. Only the Team Lead may call this tool.',
       parameters: {
@@ -678,31 +763,41 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
       output: jsonOutput(SPAWN_SPECIALIST_VALUE_SCHEMA),
       async execute(args, exec) {
         const agent = callingAgent(exec.agent, 'spawn_specialist')
-        const agentOptions = await resolveTeammateAgentOptions(
-          ctx,
-          agent,
-          teamSelectionPolicy,
-          'fresh',
-          args.provider,
-          args.model,
-          args.reasoning_effort,
-          exec.signal,
-        )
-        const result: StartSpecialistResult = await ctx.agentTeams.startSpecialist(agent, {
-          name: args.name,
-          task: args.task,
-          provider: config.freshProvider,
-          ...(agentOptions !== undefined ? { agentOptions } : {}),
-          signal: exec.signal,
-        })
-        if (result.member !== undefined) {
-          return { status: result.status, name: result.name, member: modelMember(result.member) }
+        const mode = orchestrationModeOf(ctx.sessionProjections, teamSession)
+
+        const start = async () => {
+          const turnKey = specialistContinuationTurnKey(teamSession)
+          const continuation = specialistContinuationStateOf(ctx.sessionProjections, teamSession, turnKey)
+          assertAutomaticSpecialistStart(mode, continuation)
+          const agentOptions = await resolveTeammateAgentOptions(
+            ctx,
+            agent,
+            teamSelectionPolicy,
+            'fresh',
+            args.provider,
+            args.model,
+            args.reasoning_effort,
+            exec.signal,
+          )
+          const result: StartSpecialistResult = await ctx.agentTeams.startSpecialist(agent, {
+            name: args.name,
+            task: args.task,
+            provider: config.freshProvider,
+            ...(agentOptions !== undefined ? { agentOptions } : {}),
+            signal: exec.signal,
+          })
+          if (mode !== 'off') recordAutomaticSpecialistStart(teamSession, turnKey, continuation.wave)
+          if (result.member !== undefined) {
+            return { status: result.status, name: result.name, member: modelMember(result.member) }
+          }
+          return {
+            status: result.status,
+            name: result.name,
+            ...result.pending !== undefined ? { pending: result.pending } : {},
+          }
         }
-        return {
-          status: result.status,
-          name: result.name,
-          ...result.pending !== undefined ? { pending: result.pending } : {},
-        }
+
+        return mode === 'off' ? await start() : await serializeContinuation(String(teamSession.id), start)
       },
     })))
   } catch (error: unknown) {
@@ -720,6 +815,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   // the session-bound policy. Registration is ref-counted and safe across HMR cycles.
   ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
   ctx.sessionProjections.register(orchestrationModeProjectionDefinition)
+  ctx.sessionProjections.register(specialistContinuationProjectionDefinition)
   const resolved: Required<Config> = {
     interrupt: config.interrupt ?? true,
     freshProvider: config.freshProvider ?? 'spawn',

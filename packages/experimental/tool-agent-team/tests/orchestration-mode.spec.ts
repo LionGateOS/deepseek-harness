@@ -45,6 +45,11 @@ import {
   recordOrchestrationMode,
 } from '../src/orchestration-mode.ts'
 import type { OrchestrationMode } from '../src/orchestration-mode.ts'
+import {
+  recordAutomaticSpecialistStart,
+  recordSpecialistCheckpoint,
+  specialistContinuationStateOf,
+} from '../src/continuation-gate.ts'
 
 const SIGNAL = new AbortController().signal
 const TEAM_POLICY_PREFIX = 'Agent Teams is available in this session'
@@ -69,6 +74,7 @@ const TEAM_TOOLS = [
   'team_task_update',
   'list_specialists',
   'list_specialist_status',
+  'specialist_checkpoint',
   'spawn_specialist',
 ].sort()
 
@@ -451,5 +457,70 @@ describe('orchestration mode authority boundaries', () => {
     // The Team section still renders in full without a command registry.
     expect(policy).toContain(TEAM_POLICY_PREFIX)
     expect(policy).toContain('The Lead must wait for required teammates before giving the final answer.')
+  })
+})
+
+
+describe('continuation gate durability', () => {
+  it('recovers wave, count, and closed state from the persisted Lead session', async () => {
+    const first = await setup({ commands: true })
+    const turnKey = 0
+
+    recordAutomaticSpecialistStart(first.lead.session, turnKey, 1)
+    recordAutomaticSpecialistStart(first.lead.session, turnKey, 1)
+    recordSpecialistCheckpoint(
+      first.lead.session,
+      turnKey,
+      1,
+      'continue',
+      'Wave 1 settled with an unresolved integration boundary.',
+    )
+    recordAutomaticSpecialistStart(first.lead.session, turnKey, 2)
+    recordSpecialistCheckpoint(
+      first.lead.session,
+      turnKey,
+      2,
+      'synthesize',
+      'Wave 2 settled and no further automatic wave is allowed.',
+    )
+
+    expect(specialistContinuationStateOf(
+      first.ctx.sessionProjections,
+      first.lead.session,
+      turnKey,
+    )).toEqual({
+      turnKey,
+      wave: 2,
+      startedInWave: 1,
+      closed: true,
+    })
+
+    await first.ctx.sessions.flush(first.lead.session)
+    await first.ctx.fiber.dispose()
+    contexts.delete(first.ctx)
+
+    const second = await setup({
+      commands: true,
+      storageRoot: first.storageRoot,
+      leadSessionId: SessionId('resumed-continuation-lead'),
+    })
+
+    const resumed = await second.ctx.agents.resume({
+      resumeSessionId: SessionId('orchestration-lead'),
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+
+    expect(specialistContinuationStateOf(
+      second.ctx.sessionProjections,
+      resumed.agent.session,
+      turnKey,
+    )).toEqual({
+      turnKey,
+      wave: 2,
+      startedInWave: 1,
+      closed: true,
+    })
+
+    await resumed.dispose()
   })
 })
