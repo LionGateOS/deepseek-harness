@@ -6,20 +6,22 @@ import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
 import SubagentService from '@deepseek-ai/dsh-subagent'
+import type { SubagentCapabilities } from '@deepseek-ai/dsh-subagent'
 import * as SubagentFork from '@deepseek-ai/dsh-subagent-fork-in-process'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import { renderPrompt, renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import * as ToolSubagentControl from '@deepseek-ai/dsh-tool-subagent-control'
+import SubagentModelSelectionConfig from '@deepseek-ai/dsh-tool-subagent/src/model-selection-settings.ts'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
 import { serialize } from '@deepseek-ai/dsh-llm-deepseek/src/serialize.ts'
-import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
 import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import { mountWorkingDirectoryFixture } from '../../../subagent/subagent/tests/working-directory-fixture.ts'
 import TeamService from '../../agent-team/src/index.ts'
@@ -69,7 +71,11 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function setup(script: ConstructorParameters<typeof MockAdapter>[0], legacyControl = false) {
+async function setup(
+  script: ConstructorParameters<typeof MockAdapter>[0],
+  legacyControl = false,
+  selectionConfig?: { enabled: boolean; allowedModels: Array<{ provider: string; model: string }> },
+) {
   const ctx = new Context()
   contexts.add(ctx)
   await mountAgentLoopTestDependencies(ctx)
@@ -84,8 +90,37 @@ async function setup(script: ConstructorParameters<typeof MockAdapter>[0], legac
   await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
   await ctx.plugin(SubagentFork, { providerName: 'fork' })
   await ctx.plugin(TeamService)
+  // Load the selection config before the Lead so the policy is captured at composition time.
+  if (selectionConfig !== undefined) await ctx.plugin(SubagentModelSelectionConfig, selectionConfig)
   const fiber = await ctx.plugin(toolTeam)
   const adapter = new MockAdapter(script)
+  ctx.llm.registerAdapter(['mock'], adapter)
+  const lead = await ctx.agentLoop.create(SessionId('tool-team-lead'), { provider: 'mock', model: 'mock' })
+  return { ctx, lead, fiber, adapter }
+}
+
+async function setupWithReasoning(
+  script: ConstructorParameters<typeof MockAdapter>[0],
+  reasoning: LlmModelReasoningInfo,
+  selectionConfig?: { enabled: boolean; allowedModels: Array<{ provider: string; model: string }> },
+) {
+  const ctx = new Context()
+  contexts.add(ctx)
+  await mountAgentLoopTestDependencies(ctx)
+  await mountWorkingDirectoryFixture(ctx)
+  const storageRoot = mkdtempSync(join(tmpdir(), 'dsh-tool-team-'))
+  roots.push(storageRoot)
+  await ctx.plugin(JsonlSessionPersistence, { root: storageRoot })
+  await ctx.plugin(TestSessionQuery)
+  await ctx.plugin(AgentLoop, { agents: [] })
+  await ctx.plugin(SubagentService)
+  await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
+  await ctx.plugin(SubagentFork, { providerName: 'fork' })
+  await ctx.plugin(TeamService)
+  // Load the selection config before the Lead so the policy is captured at composition time.
+  if (selectionConfig !== undefined) await ctx.plugin(SubagentModelSelectionConfig, selectionConfig)
+  const fiber = await ctx.plugin(toolTeam)
+  const adapter = new MockAdapter(script, reasoning)
   ctx.llm.registerAdapter(['mock'], adapter)
   const lead = await ctx.agentLoop.create(SessionId('tool-team-lead'), { provider: 'mock', model: 'mock' })
   return { ctx, lead, fiber, adapter }
@@ -762,7 +797,7 @@ describe('dsh-tool-team', () => {
     expect(text(result)).toContain('unknown tool "list_agents"')
     expect('default' in toolTeam).toBe(false)
     expect(toolTeam.name).toBe('tool-agent-team')
-    expect(toolTeam.inject).toEqual(['agents', 'agentTeams', 'tools', 'systemPrompt'])
+    expect(toolTeam.inject).toEqual(['agents', 'agentTeams', 'tools', 'systemPrompt', 'sessionProjections'])
   })
 
   it('uses configured fresh and fork provider names', async () => {
@@ -777,5 +812,548 @@ describe('dsh-tool-team', () => {
     const childId = spawnedChildId(ctx, lead, result)
     await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() }, { timeout: 5_000 })
     expect(ctx.agentTeams.listMembers(lead)[1]).toMatchObject({ provider: 'team-fresh' })
+  })
+
+  describe('single-model multi-agent', () => {
+    // These tests verify that multiple independent agent Sessions can use the
+    // same provider/model route, demonstrating native single-model multi-agent
+    // operation. All agents share one adapter instance; requests are handled
+    // sequentially by the MockAdapter (one inference slot), establishing that
+    // agent concurrency and inference concurrency are independent concerns.
+
+    it('one lead and three teammates all use the same model; sessions and contexts are independent', async () => {
+      // Three distinct text responses: one per teammate.
+      const { ctx, lead, adapter } = await setup([
+        textResponse('worker-1 task complete'),
+        textResponse('worker-2 task complete'),
+        textResponse('worker-3 task complete'),
+      ])
+
+      // Spawn three fresh teammates. All inherit the Lead's mock/mock route.
+      const spawn1 = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'worker-1', description: 'First worker', prompt: 'Complete task 1',
+      })
+      const spawn2 = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'worker-2', description: 'Second worker', prompt: 'Complete task 2',
+      })
+      const spawn3 = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'worker-3', description: 'Third worker', prompt: 'Complete task 3',
+      })
+
+      expect(spawn1.isError, text(spawn1)).toBe(false)
+      expect(spawn2.isError, text(spawn2)).toBe(false)
+      expect(spawn3.isError, text(spawn3)).toBe(false)
+
+      const id1 = spawnedChildId(ctx, lead, spawn1)
+      const id2 = spawnedChildId(ctx, lead, spawn2)
+      const id3 = spawnedChildId(ctx, lead, spawn3)
+
+      // All three are distinct sessions.
+      expect(new Set([id1, id2, id3]).size).toBe(3)
+
+      await waitNoAgent(ctx, id1)
+      await waitNoAgent(ctx, id2)
+      await waitNoAgent(ctx, id3)
+
+      // All used the same model/provider as the Lead (single-model multi-agent).
+      for (const id of [id1, id2, id3]) {
+        const request = adapter.requests.find(r => r.sessionId === id)
+        expect(request?.provider).toBe('mock')
+        expect(request?.model).toBe('mock')
+      }
+
+      // Three separate LLM calls: one per teammate session.
+      const childRequests = adapter.requests.filter(r =>
+        r.sessionId === id1 || r.sessionId === id2 || r.sessionId === id3)
+      expect(childRequests).toHaveLength(3)
+
+      // Sessions are independent: each request carries a distinct session id.
+      const sessionIds = childRequests.map(r => r.sessionId)
+      expect(new Set(sessionIds).size).toBe(3)
+
+      // Roster shows Lead + 3 teammates.
+      const members = ctx.agentTeams.listMembers(lead)
+      expect(members).toHaveLength(4)
+      expect(members.map(m => m.name).sort()).toEqual(['lead', 'worker-1', 'worker-2', 'worker-3'])
+
+      // Teammates ran on separate sessions with independent initial prompts.
+      for (const [id, expected] of [[id1, 'Complete task 1'], [id2, 'Complete task 2'], [id3, 'Complete task 3']] as const) {
+        const req = adapter.requests.find(r => r.sessionId === id)
+        const userMessages = req?.messages.filter(m => m.role === 'user') ?? []
+        expect(JSON.stringify(userMessages)).toContain(expected)
+      }
+    })
+
+    it('shared task board is accessible to all three teammates on the same model', async () => {
+      const { ctx, lead } = await setup([
+        textResponse('task-1 done'),
+        textResponse('task-2 done'),
+        textResponse('task-3 done'),
+      ])
+
+      // Create three tasks before spawning teammates.
+      const t1Result = await execute(ctx, lead, 'team_task_create', {
+        subject: 'Task A', description: 'First task description',
+      })
+      const t2Result = await execute(ctx, lead, 'team_task_create', {
+        subject: 'Task B', description: 'Second task description',
+      })
+      const t3Result = await execute(ctx, lead, 'team_task_create', {
+        subject: 'Task C', description: 'Third task description',
+      })
+      expect(t1Result.isError).toBe(false)
+      expect(t2Result.isError).toBe(false)
+      expect(t3Result.isError).toBe(false)
+
+      const t1 = JSON.parse(text(t1Result)) as { id: string; revision: number }
+      const t2 = JSON.parse(text(t2Result)) as { id: string; revision: number }
+      const t3 = JSON.parse(text(t3Result)) as { id: string; revision: number }
+
+      // Spawn teammates.
+      const s1 = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'task-worker-a', description: 'Worker A', prompt: 'Handle Task A',
+      })
+      const s2 = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'task-worker-b', description: 'Worker B', prompt: 'Handle Task B',
+      })
+      const s3 = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'task-worker-c', description: 'Worker C', prompt: 'Handle Task C',
+      })
+      expect(s1.isError, text(s1)).toBe(false)
+      expect(s2.isError, text(s2)).toBe(false)
+      expect(s3.isError, text(s3)).toBe(false)
+
+      const id1 = spawnedChildId(ctx, lead, s1)
+      const id2 = spawnedChildId(ctx, lead, s2)
+      const id3 = spawnedChildId(ctx, lead, s3)
+
+      // Lead assigns one task to each teammate (Lead-only reassign action).
+      await execute(ctx, lead, 'team_task_update', {
+        task_id: t1.id, expected_revision: t1.revision, action: 'reassign', owner: 'task-worker-a',
+      })
+      await execute(ctx, lead, 'team_task_update', {
+        task_id: t2.id, expected_revision: t2.revision, action: 'reassign', owner: 'task-worker-b',
+      })
+      await execute(ctx, lead, 'team_task_update', {
+        task_id: t3.id, expected_revision: t3.revision, action: 'reassign', owner: 'task-worker-c',
+      })
+
+      await waitNoAgent(ctx, id1)
+      await waitNoAgent(ctx, id2)
+      await waitNoAgent(ctx, id3)
+
+      // Task board still shows the three pending tasks (teammates ran but no tool calls).
+      const taskList = await execute(ctx, lead, 'team_task_list', {})
+      const tasks = JSON.parse(text(taskList)) as { tasks: Array<{ subject: string; ownerName: string }> }
+      expect(tasks.tasks).toHaveLength(3)
+      expect(tasks.tasks.map(t => t.ownerName).sort()).toEqual(['task-worker-a', 'task-worker-b', 'task-worker-c'])
+
+      // All five agents (Lead + 3 live teammates) are on the roster.
+      expect(ctx.agentTeams.listMembers(lead)).toHaveLength(4)
+    })
+
+    it('send_message resumes an inactive teammate on the same model without a second server', async () => {
+      // 'hang' keeps the agent in running state so waitRunning can observe it before
+      // the turn completes — required because MockAdapter is synchronous.
+      const { ctx, lead, adapter } = await setup([
+        textResponse('initial task complete'),
+        'hang',
+      ])
+
+      const spawn = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'resumable', description: 'Resumable worker', prompt: 'First task',
+      })
+      expect(spawn.isError, text(spawn)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, spawn)
+
+      // After the first turn, wait for the second LLM request to arrive (first request).
+      // This confirms the agent ran its initial turn.
+      await vi.waitFor(() => { expect(adapter.requests.length).toBeGreaterThanOrEqual(1) }, { timeout: 5_000 })
+      await waitNoAgent(ctx, childId)
+
+      // Teammate is inactive after completing its turn.
+      const listAfter = JSON.parse(text(await execute(ctx, lead, 'list_agents', {}))) as Array<{ target: string; status: string }>
+      expect(listAfter.find(m => m.target === 'resumable')?.status).toBe('inactive')
+
+      // Lead resumes the teammate by sending a message.
+      const receipt = await ctx.agentTeams.sendMessage(lead, {
+        target: 'resumable',
+        content: [{ type: 'text', text: 'Please resume work' }],
+        signal: SIGNAL,
+      })
+      expect(receipt.messageId).toEqual(expect.any(String))
+      const resumed = await waitRunning(ctx, childId)
+
+      // Resumed teammate still uses the same model — no route switch, no new server.
+      expect(resumed.options.model).toBe('mock')
+      expect(resumed.options.provider).toBe('mock')
+
+      // Verify: the second LLM call came from the same adapter and same model.
+      const secondReq = adapter.requests.at(-1)!
+      expect(secondReq.sessionId).toBe(childId)
+      expect(secondReq.model).toBe('mock')
+
+      ctx.agentTeams.interrupt(lead, 'resumable')
+      await waitNoAgent(ctx, childId)
+    }, 15_000)
+
+    it('effort-only override on the inherited route is authorized without an allowlist entry', async () => {
+      // The parent uses mock/mock. An effort-only override for a fresh teammate
+      // inherits the same route and does NOT require mock/mock in the allowlist.
+      // Model selection must still be enabled, but the allowlist is not consulted.
+      // mock/mock is intentionally absent — effort-only does NOT consult the allowlist.
+      const { ctx, lead, adapter } = await setupWithReasoning(
+        [textResponse('effort child done')],
+        { efforts: [{ id: ReasoningEffortId('low'), name: 'Low' }, { id: ReasoningEffortId('medium'), name: 'Medium' }] },
+        { enabled: true, allowedModels: [{ provider: 'other', model: 'other-model' }] },
+      )
+
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'effort-fresh', description: 'effort fresh', prompt: 'go',
+        reasoning_effort: 'low',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      const childReq = adapter.requests.find(r => r.sessionId === childId)
+      expect(childReq?.reasoningEffort).toBe('low')
+      expect(childReq?.model).toBe('mock') // inherited route
+    })
+
+    it('fork effort-only override is authorized; fork provider+model override is rejected', async () => {
+      // Fork with effort-only: authorized even when mock/mock is absent from the allowlist.
+      const { ctx, lead, adapter } = await setupWithReasoning([
+        textResponse('parent turn'),
+        textResponse('fork effort done'),
+      ], { efforts: [{ id: ReasoningEffortId('medium'), name: 'Medium' }] },
+      { enabled: true, allowedModels: [{ provider: 'other', model: 'other-model' }] })
+      await runTurn(lead, 'parent work')
+
+      const forkEffort = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'fork-effort', description: 'fork with effort', prompt: 'continue',
+        context: 'fork', reasoning_effort: 'medium',
+      })
+      expect(forkEffort.isError, text(forkEffort)).toBe(false)
+      const forkId = spawnedChildId(ctx, lead, forkEffort)
+      await waitNoAgent(ctx, forkId)
+
+      // The fork ran under the parent's model route.
+      const forkReq = adapter.requests.find(r => r.sessionId === forkId)
+      expect(forkReq?.model).toBe('mock')
+      expect(forkReq?.reasoningEffort).toBe('medium')
+
+      // Fork with route change: rejected before the auth gate, regardless of allowlist.
+      const forkRoute = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'fork-route', description: 'fork with route change', prompt: 'go',
+        context: 'fork', provider: 'mock', model: 'mock-fast',
+      })
+      expect(forkRoute.isError).toBe(true)
+      expect(text(forkRoute)).toContain('fork teammates inherit the parent route')
+    })
+  })
+
+  describe('model selection', () => {
+    const ALLOWED_ROUTES = [
+      { provider: 'mock', model: 'mock' },
+      { provider: 'mock', model: 'mock-fast' },
+    ]
+
+    /** Set up a context with model selection enabled, using the ALLOWED_ROUTES list. */
+    async function setupWithSelection(script: ConstructorParameters<typeof MockAdapter>[0]) {
+      return setup(script, false, { enabled: true, allowedModels: ALLOWED_ROUTES })
+    }
+
+    it('existing spawn without model selection fields uses pure parent inheritance (test #1)', async () => {
+      const { ctx, lead } = await setup([textResponse('child done')])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'no-selection', description: 'no selection', prompt: 'go',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      // Child should have inherited the Lead's route.
+      expect(ctx.agentTeams.listMembers(lead)[1]).toMatchObject({ name: 'no-selection' })
+    })
+
+    it('fresh teammate receives authorized provider and model (test #2)', async () => {
+      const { ctx, lead, adapter } = await setupWithSelection([textResponse('authorized child')])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'authorized', description: 'authorized model', prompt: 'go',
+        provider: 'mock', model: 'mock-fast',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      // Child ran under the selected route — verified via the LLM adapter request.
+      const childRequest = adapter.requests.find(r => r.sessionId === childId)
+      expect(childRequest?.model).toBe('mock-fast')
+    })
+
+    it('explicit reasoning effort is forwarded to the child (test #3)', async () => {
+      // Register a separate provider that declares reasoning-effort support.
+      // Selection config is loaded before the Lead so the policy is captured at composition time.
+      const { ctx, lead } = await setup([], false, {
+        enabled: true,
+        allowedModels: [{ provider: 'mock-reasoning-provider', model: 'mock' }],
+      })
+      const reasoningAdapter = new MockAdapter([textResponse('effort child')], {
+        efforts: [
+          { id: ReasoningEffortId('low'), name: 'Low' },
+          { id: ReasoningEffortId('medium'), name: 'Medium' },
+          { id: ReasoningEffortId('high'), name: 'High' },
+        ],
+      })
+      ctx.llm.registerAdapter(['mock-reasoning-provider'], reasoningAdapter)
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'effort-worker', description: 'with effort', prompt: 'go',
+        provider: 'mock-reasoning-provider', model: 'mock', reasoning_effort: 'low',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      const childRequest = reasoningAdapter.requests.find(r => r.sessionId === childId)
+      expect(childRequest?.reasoningEffort).toBe('low')
+    })
+
+    it('changed model without reasoning effort uses selected model default (test #4)', async () => {
+      // Lead has no reasoningEffort; child route changes to mock-fast with no effort.
+      // resolveChildAgentOptions clears inherited effort on route change, so none is passed.
+      const { ctx, lead, adapter } = await setupWithSelection([textResponse('fast child')])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'fast-worker', description: 'fast model', prompt: 'go',
+        provider: 'mock', model: 'mock-fast',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      const childRequest = adapter.requests.find(r => r.sessionId === childId)
+      expect(childRequest?.model).toBe('mock-fast')
+      // No explicit reasoning effort was forwarded.
+      expect(childRequest?.reasoningEffort).toBeUndefined()
+    })
+
+    it('unauthorized provider/model is rejected before provisioning (test #5)', async () => {
+      const { ctx, lead } = await setupWithSelection([])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'blocked', description: 'unlisted route', prompt: 'go',
+        provider: 'mock', model: 'unlisted-model',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('not allowed for this Session')
+      // No roster entry created.
+      expect(ctx.agentTeams.listMembers(lead)).toHaveLength(1)
+    })
+
+    it('provider without model (incomplete route) is rejected (test #6)', async () => {
+      const { ctx, lead } = await setupWithSelection([])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'incomplete', description: 'incomplete route', prompt: 'go',
+        provider: 'mock',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('must be supplied together')
+      expect(ctx.agentTeams.listMembers(lead)).toHaveLength(1)
+    })
+
+    it('model without provider (incomplete route) is rejected (test #6b)', async () => {
+      const { ctx, lead } = await setupWithSelection([])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'incomplete-b', description: 'incomplete route b', prompt: 'go',
+        model: 'mock',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('must be supplied together')
+      expect(ctx.agentTeams.listMembers(lead)).toHaveLength(1)
+    })
+
+    it('disabled model selection cannot be bypassed (test #7)', async () => {
+      // Service not loaded at all.
+      const { ctx, lead } = await setup([])
+      const noServiceResult = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'blocked-no-service', description: 'no service', prompt: 'go',
+        provider: 'mock', model: 'mock',
+      })
+      expect(noServiceResult.isError).toBe(true)
+      expect(text(noServiceResult)).toContain('disabled')
+      expect(ctx.agentTeams.listMembers(lead)).toHaveLength(1)
+
+      // Service loaded with enabled: false before the Lead so policy is captured at composition time.
+      const { ctx: ctx2, lead: lead2 } = await setup([], false, { enabled: false, allowedModels: ALLOWED_ROUTES })
+      const disabledResult = await execute(ctx2, lead2, 'spawn_teammate', {
+        name: 'blocked-disabled', description: 'disabled', prompt: 'go',
+        provider: 'mock', model: 'mock',
+      })
+      expect(disabledResult.isError).toBe(true)
+      expect(text(disabledResult)).toContain('disabled')
+      expect(ctx2.agentTeams.listMembers(lead2)).toHaveLength(1)
+    })
+
+    it('provider without agentOptions capability fails explicitly (test #8)', async () => {
+      // Register a provider with agentOptions: false.
+      const { ctx, lead, fiber } = await setup([])
+      await fiber.dispose()
+      ctx.subagents.registerProvider({
+        name: 'no-agent-opts',
+        capabilities: {
+          agentOptions: false,
+          agentPreset: false,
+          outputSchema: false,
+          depthLimit: false,
+        } satisfies SubagentCapabilities,
+        inheritsParentContext: false,
+        async prepareContinuable() { return {} },
+      })
+      await ctx.plugin(SubagentModelSelectionConfig, { enabled: true, allowedModels: ALLOWED_ROUTES })
+      await ctx.plugin(toolTeam, { freshProvider: 'no-agent-opts', forkProvider: 'fork' })
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'capability-check', description: 'no agentOptions support', prompt: 'go',
+        provider: 'mock', model: 'mock',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toMatch(/UNSUPPORTED_CAPABILITY|capability/u)
+    })
+
+    it('fork without overrides inherits parent route (test #9)', async () => {
+      const { ctx, lead, adapter } = await setup([textResponse('parent'), textResponse('fork child')])
+      await runTurn(lead, 'parent work')
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'fork-inherits', description: 'fork inherits', prompt: 'continue',
+        context: 'fork',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      const childRequest = adapter.requests.find(r => r.sessionId === childId)
+      // Fork child runs under the same route as the Lead.
+      expect(childRequest?.model).toBe(lead.options.model)
+    })
+
+    it('fork with provider/model override is rejected (test #10)', async () => {
+      const { ctx, lead } = await setupWithSelection([])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'fork-override', description: 'fork route change', prompt: 'go',
+        context: 'fork',
+        provider: 'mock', model: 'mock-fast',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('fork teammates inherit the parent route')
+      expect(ctx.agentTeams.listMembers(lead)).toHaveLength(1)
+    })
+
+    it('durable resume of a fresh teammate retains selected child configuration (test #12)', async () => {
+      const { ctx, lead } = await setupWithSelection([textResponse('first turn'), textResponse('woken up')])
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'persistent', description: 'route persisted', prompt: 'finish first',
+        provider: 'mock', model: 'mock-fast',
+      })
+      expect(result.isError, text(result)).toBe(false)
+      const childId = spawnedChildId(ctx, lead, result)
+      await waitNoAgent(ctx, childId)
+      // Resume the teammate via sendMessage (cold resume path).
+      const receipt = await ctx.agentTeams.sendMessage(lead, {
+        target: 'persistent',
+        content: [{ type: 'text', text: 'wake up' }],
+        signal: SIGNAL,
+      })
+      expect(receipt.messageId).toEqual(expect.any(String))
+      const resumed = await waitRunning(ctx, childId)
+      // Resumed child must still use the originally selected route.
+      expect(resumed.options.model).toBe('mock-fast')
+      ctx.agentTeams.interrupt(lead, 'persistent')
+      await waitNoAgent(ctx, childId)
+    })
+
+    it('existing Task and roster behavior is unchanged by model selection code (test #13)', async () => {
+      const { ctx, lead } = await setupWithSelection([textResponse('worker done')])
+      const spawnResult = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'task-worker', description: 'task worker', prompt: 'do task',
+      })
+      expect(spawnResult.isError, text(spawnResult)).toBe(false)
+      await waitNoAgent(ctx, spawnedChildId(ctx, lead, spawnResult))
+      const task = await execute(ctx, lead, 'team_task_create', {
+        subject: 'model-selection-task', description: 'task unchanged',
+      })
+      expect(task.isError).toBe(false)
+      const listed = await execute(ctx, lead, 'team_task_list', {})
+      expect(JSON.parse(text(listed))).toMatchObject({ tasks: [{ subject: 'model-selection-task' }] })
+    })
+  })
+})
+
+describe('delegation policy guidance', () => {
+  it('presents specialists as optional and context-dependent rather than required', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    expect(policy).toContain('Specialists are optional tools, not a required step.')
+    expect(policy).toContain('Start the smallest team that covers the work')
+  })
+
+  it('states the conditions under which delegation is worth its cost', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    for (const benefit of [
+      'independently verifying finished work',
+      'reviewing architecture or design',
+      'auditing security or safety',
+      'separating implementation from review',
+      'separating research from synthesis',
+      'investigating independent parts in parallel',
+    ]) expect(policy).toContain(benefit)
+  })
+
+  it('states the conditions under which delegation wastes effort', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    expect(policy).toContain('trivial or single-step')
+    expect(policy).toContain('describing the work costs more than doing it')
+    expect(policy).toContain('duplicate work already underway')
+    expect(policy).toContain('cannot be stated clearly and completely')
+  })
+
+  it('keeps task decomposition, result interpretation, and final synthesis with the Lead', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    expect(policy).toContain('As Team Lead you own the outcome')
+    expect(policy).toContain('Decompose the task')
+    expect(policy).toContain('write the final answer yourself')
+    expect(policy).toContain('does not replace it')
+  })
+
+  it('requires a concrete assignment and denies that the assignment widens authority', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    expect(policy).toContain('acceptance criteria')
+    expect(policy).toContain('`task` selects work and never widens a specialist')
+    expect(policy).toContain('permissions, or route')
+    expect(policy).toContain('requesting wider authority')
+  })
+
+  it('defers scheduling and route limits to the existing concurrency and model-selection policy', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    expect(policy).toContain('per-team concurrency cap and FIFO queue')
+    expect(policy).toContain('session route and model-selection policy')
+    expect(policy).toContain('only the Team Lead can start specialists')
+  })
+
+  it('rules out nested delegation and duplicate assignments', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const policy = renderPrompt(await assembly(ctx, lead))
+    expect(policy).toContain('a teammate cannot start a specialist')
+    expect(policy).toContain('do not start several specialists on the same assignment')
+  })
+
+  it('shares the delegation guidance with teammates without granting them specialist access', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'policy-worker', description: 'policy reader', prompt: 'wait',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    const child = await waitRunning(ctx, childId)
+    expect(renderPrompt(await assembly(ctx, child))).toBe(renderPrompt(await assembly(ctx, lead)))
+    const denied = await execute(ctx, child, 'spawn_specialist', { name: 'code-reviewer', task: 'review' })
+    expect(denied.isError).toBe(true)
+    await execute(ctx, lead, 'interrupt_agent', { target: 'policy-worker' })
+    await waitNoAgent(ctx, childId)
   })
 })

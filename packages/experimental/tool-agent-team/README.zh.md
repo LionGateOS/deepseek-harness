@@ -1,5 +1,5 @@
 ---
-description: "九个让模型创建、发消息与协调 teammate 的工具，供挂载实验性 Team 插件的组合使用。"
+description: "十二个让模型创建、发消息与协调 teammate 与 specialist 的工具，供挂载实验性 Team 插件的组合使用。"
 kind: "package-reference"
 ---
 
@@ -9,12 +9,13 @@ kind: "package-reference"
 
 ## 概述
 
-本包让模型创建具名 teammate、向它们发送消息、查看可用状态、等待进展、中断卡住的工作，并通过共享任务板协调。每个团队成员都会获得相同的九个工具，以及在共享工作区协调的指引。它会取代同名的旧版 subagent 控件，因此同时需要两者的组合必须禁用旧定义。本包以实验性名称公开发布，但不提供稳定性保证。
+本包让模型创建具名 teammate、向它们发送消息、查看可用状态、等待进展、中断卡住的工作，并通过共享任务板协调。每个团队成员都会获得相同的十二个工具，以及在共享工作区协调的指引，owner 通过持久的 `/orchestrate` 模式选择 Lead 的委派积极程度。它会取代同名的旧版 subagent 控件，因此同时需要两者的组合必须禁用旧定义。本包以实验性名称公开发布，但不提供稳定性保证。
 
 ## 目录
 
 - [使用本包](#use-this-package)
 - [理解实现](#understand-the-implementation)
+- [选择 Lead 的委派积极程度](#choose-how-eagerly-the-lead-delegates)
 - [进一步探索](#further-exploration)
 - [模型体验](#model-experience)
 - [已知限制与延期工作](#known-limitations-and-deferred-work)
@@ -25,7 +26,7 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
-当模型应该通过工具运行一支团队时，在 `@deepseek-ai/dsh-experimental-agent-team` 之上挂载本包。挂载后，每个团队成员——Lead 与每个 teammate——都会获得相同的九个工具，以及相同的协作策略。`spawn_teammate` 原样发送初始任务；每个成员通过必需的 runtime context 接收当前角色和名字。
+当模型应该通过工具运行一支团队时，在 `@deepseek-ai/dsh-experimental-agent-team` 之上挂载本包。挂载后，每个团队成员——Lead 与每个 teammate——都会获得相同的十二个工具，以及相同的协作策略。`spawn_teammate` 原样发送初始任务；每个成员通过必需的 runtime context 接收当前角色和名字。
 
 ### 何时选择
 
@@ -52,14 +53,31 @@ kind: "package-reference"
 
 试试这样要求 Lead 模型：「创建一个名为 reviewer 的 teammate 检查 diff，再把变更摘要发给 reviewer」。模型会调用创建工具，然后调用消息工具。
 
+<a id="choose-how-eagerly-the-lead-delegates"></a>
+### 选择 Lead 的委派积极程度
+
+owner 通过 `/orchestrate` 为会话设置编排模式：
+
+```
+/orchestrate off      # no automatic delegation; explicit requests only
+/orchestrate auto     # the Lead judges whether a specialist pays off (default)
+/orchestrate on       # strongly prefer a useful specialist for non-trivial work
+/orchestrate status   # report the current mode
+```
+
+`auto` 是默认值，因此从未运行过该命令的会话行为即为 `auto`，且不会记录选择。该选择是持久的：它作为 plugin record 写入 Lead 的 Session 日志，并由 projection 折叠，因此能在会话恢复与 fork 后保留，且绝不从聊天文本推导。只有 Team Lead 可以设置；teammate 的尝试会被拒绝。模式只改变委派偏好——绝不会扩大权限、模型选择路由、并发或权威，且 `off` 仍保留全部 specialist 工具以供显式使用。
+
 ### 模型能做什么
 
-九个工具分为四类能力：
+十二个工具分为五类能力：
 
 - **创建 teammate**——`spawn_teammate` 接收名字、描述与初始任务；只有 Lead 可以调用它。
 - **发送消息**——`send_message` 在最近的步骤边界对运行中的成员进行 steering（中途引导）、启动或恢复非活动成员。
 - **查看与等待**——`list_agents` 返回各成员的 `target` 与可用状态；`wait_agent` 等待下一次团队变化；`interrupt_agent` 停止 teammate 的当前轮次（仅限 Lead）。
 - **管理任务板**——`team_task_create`、`team_task_list`、`team_task_get` 与 `team_task_update` 添加、浏览、读取与更新共享任务。
+- **运行目录中的 specialist**——`list_specialists` 列出已配置的目录，`list_specialist_status` 报告各 specialist 的队列阶段，`spawn_specialist` 按 `name` 启动一个并给出具体的 `task`（仅限 Lead）。
+
+`spawn_specialist` 接收两个不同的输入：`name` 选择目录角色，`task` 是具体工作。specialist 总是先收到目录角色文本，随后再收到独立的指派段落，该段落说明指派不会扩展权限范围，也不会替换角色。排队中的 specialist 在槽位空出后以相同的角色与指派启动。
 
 创建和列表结果使用 `target` 标识成员，不包含成员 Session ID。可将该值用于消息和中断调用，或任务工具的 `owner` 参数；任务的 `ownerName` 使用相同值。`inactive` 表示没有轮次在执行，包括已加载和需要恢复的成员；它不表示任务完成或结果。`provisioning` 与 `failed` 描述成员创建状态。任何成员都可以给任何其他成员发消息并使用任务板；只有 Lead 可以创建与中断 teammate。任务更新保留领域的 owner 与 revision 校验，因此过期的编辑会被拒绝，而不是覆盖更新的成果。
 
@@ -91,11 +109,11 @@ kind: "package-reference"
 
 | 文件 | 职责 |
 |---|---|
-| [`src/index.ts`](src/index.ts) | 插件入口：配置、固定策略文本与九个 scoped 工具注册 |
+| [`src/index.ts`](src/index.ts) | 插件入口：配置、固定策略文本与十二个 scoped 工具注册 |
 
 ### 策略与工具
 
-member scope 上的一个 `team:policy` 段落说明共享的协作规则；固定文本与九个工具注册都声明在 [`src/index.ts`](src/index.ts)。九个工具 schema 注册在发布时被识别为 Team member 的 scope 中。与旧全局 continuable-subagent 控件同名的 scoped 注册只会为团队成员覆盖这些全局控件。
+member scope 上的一个 `team:policy` 段落说明共享的协作规则；固定文本与十二个工具注册都声明在 [`src/index.ts`](src/index.ts)。策略还说明了 specialist 委托何时值得其成本、何时不值得，因此 Lead 依据任务本身选择团队，而不是依据 prompt 中的指令。十二个工具 schema 注册在发布时被识别为 Team member 的 scope 中。与旧全局 continuable-subagent 控件同名的 scoped 注册只会为团队成员覆盖这些全局控件。
 
 ### 按作用域注册与拆除
 
@@ -124,7 +142,7 @@ member scope 上的一个 `team:policy` 段落说明共享的协作规则；固�
 
 #### 模型看到什么
 
-共享系统 policy 覆盖 Team 可用性、共享 cwd 安全、任务协调、Steer 投递、inbox 接收和 Lead 等待责任。Lead 与 teammate 使用相同的九个 schema；执行时落实 Lead-only 操作。必需的 runtime context 声明 `You are the Team Lead named "lead".`，或 `You are teammate "<name>".` 与 `Your Team Lead is named "lead".`，并提供 roster 和消息操作说明。身份来自当前 Team membership，关闭可选 context 时仍保留，压缩移除快照后会恢复。从 teammate 创建的普通 fork 会收到当前 Lead 身份。
+共享系统 policy 覆盖 Team 可用性、owner 选择的编排模式、共享 cwd 安全、任务协调、Steer 投递、inbox 接收、Lead 等待责任，以及何时委托给目录中的 specialist。委托指引列出值得使用 specialist 的工作——独立验证、架构或设计审查、安全或安全性审计、实现与审查分离、研究与综合分离、并行独立调查——以及不值得的情况：琐碎或单步任务、描述成本高于执行成本的委托、重复指派，以及无法在指派中完整说明的上下文。它把任务分解、specialist 选择、结果解读与最终综合都留给 Lead，并说明指派只选择工作，不扩大 specialist 的角色、权限或路由。渲染出的 policy 也会呈现当前编排模式及其指引：`off` 说明自动委托已禁用、specialist 工具仍可供显式手动使用；`auto` 要求 Lead 自行评估委托并优先选择最小的可用团队；`on` 要求 Lead 对非平凡工作强烈倾向于合适的 specialist，但不以“尽可能多地 spawn”为许可。每种模式都说明模式只改变委派偏好，不能扩大文件系统权限、模型选择权限、付费或云端路由、并发上限、specialist 角色约定或会话与工具权限，也绝不授权递归委托。Lead 与 teammate 使用相同的十二个 schema；执行时落实 Lead-only 操作。必需的 runtime context 声明 `You are the Team Lead named "lead".`，或 `You are teammate "<name>".` 与 `Your Team Lead is named "lead".`，并提供 roster 和消息操作说明。身份来自当前 Team membership，关闭可选 context 时仍保留，压缩移除快照后会恢复。从 teammate 创建的普通 fork 会收到当前 Lead 身份。
 
 #### Token 影响
 

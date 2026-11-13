@@ -19,6 +19,20 @@ export function requiredText(value: string, field: string, maxLength: number): s
 }
 
 /**
+ * Normalize one Lead-assigned specialist task.
+ *
+ * An assignment is model-authored work rather than a member identity, so it is
+ * bounded only by being non-blank; prompts carry no length limit.
+ * @param value - raw assignment text.
+ * @returns trimmed non-empty assignment.
+ */
+export function assignedTask(value: string): string {
+  const text = value.trim()
+  if (text.length === 0) throw new TeamError('task must be non-empty', 'TEAM_INVALID_ARGUMENT')
+  return text
+}
+
+/**
  * Normalize one workspace-relative path prefix without treating it as a lock.
  * @param value - user-authored path prefix.
  * @returns normalized slash-separated prefix.

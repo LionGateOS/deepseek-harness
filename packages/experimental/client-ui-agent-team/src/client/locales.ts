@@ -30,6 +30,11 @@ export const zh = {
   'status.pending': '待处理',
   'status.in_progress': '进行中',
   'status.completed': '已完成',
+  specialists: '专家队列',
+  'specialistPhase.queued': '排队中',
+  'specialistPhase.working': '运行中',
+  'specialistPhase.finished': '已完成',
+  'specialistPhase.cancelled': '已取消',
 } satisfies Record<string, string>
 
 /** Agent Teams locale key union. */
@@ -62,4 +67,9 @@ export const en = {
   'status.pending': 'Pending',
   'status.in_progress': 'In progress',
   'status.completed': 'Completed',
+  specialists: 'Specialist queue',
+  'specialistPhase.queued': 'Queued',
+  'specialistPhase.working': 'Working',
+  'specialistPhase.finished': 'Finished',
+  'specialistPhase.cancelled': 'Cancelled',
 } satisfies Record<TeamKey, string>

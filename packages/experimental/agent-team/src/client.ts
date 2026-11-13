@@ -1,6 +1,9 @@
 /** Client-safe Agent Teams roster and task views plus the `agentTeam` projection vocabulary. */
 
 export type {
+  SpecialistPhase,
+  SpecialistQueueView,
+  SpecialistStatusSnapshot,
   TeamMemberPhase,
   TeamMemberProjection,
   TeamMemberView,

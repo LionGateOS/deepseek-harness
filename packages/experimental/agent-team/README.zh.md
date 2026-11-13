@@ -52,8 +52,15 @@ kind: "package-reference"
 | `maxTasks` | `256` | 任务板上最多的活动任务数 |
 | `maxMessageBytes` | `65,536` | 单条发送消息的最大尺寸 |
 | `disposalTimeoutMs` | `5,000` | 关闭清理允许的时间 |
+| `specialists` | `[]` | 工具可按名字提供的 `{ name, description, prompt, provider? }` 目录条目 |
+| `maxActiveSpecialists` | `4` | 一支团队同时运行的 specialist 上限；其余按 FIFO 排队 |
+| `routeLimits` | `[]` | 可选的 `{ provider, maxActive }` 上限，进一步限制某条路由 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-experimental-agent-team)是每个受支持字段及其 JSDoc 的穷尽式真源。
+
+### Specialist
+
+specialist 是 Lead 可在并发预算下反复启动的具名目录角色。每个目录条目声明持久的 `prompt`——它始终位于 specialist 首条消息之前的角色约定——具体工作由 Lead 另行提供，因此一个角色可服务多次指派。启动的 specialist 超过 `maxActiveSpecialists` 时会排队；活动 specialist 结束后，排队的 specialist 自动启动，`list_specialist_status` 会报告每个 specialist 处于 `queued`、`working`、`finished` 还是 `cancelled`。
 
 ### Teammate
 

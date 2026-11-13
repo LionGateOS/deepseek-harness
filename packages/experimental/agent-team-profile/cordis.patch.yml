@@ -21,6 +21,32 @@
         maxTasks: 256
         maxMessageBytes: 65536
         disposalTimeoutMs: 5000
+        maxActiveSpecialists: 2
+        specialists:
+          - name: requirements-analyst
+            description: Breaks down goals into actionable, numbered specifications
+            prompt: "You are a requirements analyst. Analyze the given goal and produce clear, numbered requirements with acceptance criteria."
+          - name: implementation-planner
+            description: Designs ordered step-by-step implementation plans from requirements
+            prompt: "You are an implementation planner. Given a set of requirements, produce a prioritized, ordered implementation plan with clear milestones."
+          - name: code-reviewer
+            description: Reviews code for correctness, style, security, and maintainability
+            prompt: "You are a code reviewer. Review the given code and report issues grouped by severity: critical, major, minor."
+          - name: test-author
+            description: Authors unit and integration tests for provided code
+            prompt: "You are a test author. Write comprehensive unit and integration tests for the given code using the project's established test framework."
+          - name: documentation-writer
+            description: Writes clear technical documentation for components and APIs
+            prompt: "You are a documentation writer. Write concise, accurate technical documentation for the given component or API."
+          - name: security-auditor
+            description: Audits code for security vulnerabilities including OWASP top-10
+            prompt: "You are a security auditor. Audit the given code for security vulnerabilities, focusing on OWASP top-10 categories. Report findings with severity and remediation steps."
+          - name: performance-analyst
+            description: Profiles bottlenecks and proposes targeted optimizations
+            prompt: "You are a performance analyst. Profile the given code or system and propose targeted, evidence-based optimizations."
+          - name: integration-verifier
+            description: Verifies that components integrate correctly end-to-end
+            prompt: "You are an integration verifier. Verify that the given components integrate correctly end-to-end and report any interface mismatches or integration failures."
 
     - id: tool-agent-team
       name: '@deepseek-ai/dsh-experimental-tool-agent-team'

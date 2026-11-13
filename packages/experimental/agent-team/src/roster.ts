@@ -10,6 +10,7 @@ import { foldSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
 import { errorMessage, TeamError } from './error.ts'
 import type { TeamJournal } from './journal.ts'
 import type { TeamRuntimeLifecycle } from './lifecycle.ts'
+import { assertTeammateModelSelection } from './model-selection.ts'
 import { readPersistedSession } from './persisted.ts'
 import type { TeamState } from './projection.ts'
 import { messageAccepted } from './session-message.ts'
@@ -56,7 +57,7 @@ export function resolveActiveMember(
 /** Owns Team identities and the lifecycle of rostered continuable children. */
 export class TeamRoster {
   /**
-   * @param ctx - Team service context with Agent, Session, persistence, and subagent services.
+   * @param ctx - Team service context with Agent, Session, projection, persistence, and subagent services.
    * @param journal - authoritative Lead-log transaction owner.
    * @param lifecycle - shared Team runtime admission cutoff.
    * @param maxMembers - maximum immutable roster entries per Team.
@@ -236,6 +237,10 @@ export class TeamRoster {
     }
     const signal = AbortSignal.any([request.signal, this.lifecycle.signal])
     signal.throwIfAborted()
+    // Session policy gate before any durable or activation evidence: a program-
+    // matic caller must not bypass the model-selection validation the tool layer
+    // already applies to spawn_teammate calls.
+    assertTeammateModelSelection(this.ctx.sessionProjections, membership.root, request.context, request.agentOptions)
     const root = membership.root
     const name = this.memberName(request.name)
     const description = requiredText(request.description, 'description', 200)
@@ -269,6 +274,7 @@ export class TeamRoster {
         request: {
           prompt: request.prompt,
           parent: root,
+          ...request.agentOptions !== undefined ? { agentOptions: request.agentOptions } : {},
         },
         signal,
       })

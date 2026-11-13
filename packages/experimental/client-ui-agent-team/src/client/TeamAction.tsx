@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {
+  SpecialistPhase,
+  SpecialistStatusSnapshot,
   TeamMemberProjection,
   TeamTaskView as TeamTask,
 } from '@deepseek-ai/dsh-experimental-agent-team/client'
@@ -54,6 +56,24 @@ function memberDotState(status: Exclude<MemberStatus, 'inactive'>): StateDotStat
     case 'running':
     case 'provisioning': return 'ongoing'
     case 'failed': return 'error'
+  }
+}
+
+function specialistPhaseKey(phase: SpecialistPhase): TeamKey {
+  switch (phase) {
+    case 'queued': return 'specialistPhase.queued'
+    case 'working': return 'specialistPhase.working'
+    case 'finished': return 'specialistPhase.finished'
+    case 'cancelled': return 'specialistPhase.cancelled'
+  }
+}
+
+function specialistDotState(phase: SpecialistPhase): StateDotState {
+  switch (phase) {
+    case 'queued': return 'idle'
+    case 'working': return 'ongoing'
+    case 'finished': return 'done'
+    case 'cancelled': return 'warning'
   }
 }
 
@@ -191,6 +211,7 @@ export function TeamAction({
   const positioned = position !== null
   const leadSessionId = useSession(snapshot => snapshot.subagent?.address.parentSessionId) ?? sessionId
   const team = useSessions(state => state.projectionsBySession[leadSessionId]?.values.agentTeam)
+  const specialistQueue = useSessions(state => state.projectionsBySession[leadSessionId]?.values.agentTeamSpecialists)
   const opening = useSession(snapshot => snapshot.openState === 'loading')
   const listing = useSessions(state => state.phase === 'pending')
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -260,7 +281,10 @@ export function TeamAction({
     return () => { document.removeEventListener('keydown', dismiss) }
   }, [open])
 
-  const compact = team !== undefined && team.members.length === 1 && team.tasks.length === 0
+  const activeSpecialists = specialistQueue?.specialists.filter(
+    (s): s is SpecialistStatusSnapshot => s.phase === 'queued' || s.phase === 'working',
+  ) ?? []
+  const compact = team !== undefined && team.members.length === 1 && team.tasks.length === 0 && activeSpecialists.length === 0
 
   return (
     <div
@@ -347,6 +371,31 @@ export function TeamAction({
                       </>
                     )}
                 </section>
+                {activeSpecialists.length > 0 && (
+                  <section>
+                    <h3>{t('specialists')}<span className={css.count}>{activeSpecialists.length}</span></h3>
+                    <div className={css.roster}>
+                      {activeSpecialists.map(specialist => (
+                        <div key={`${specialist.name}-${specialist.phase}`} className={css.member}>
+                          <span className={css.memberDot}>
+                            <StateDot state={specialistDotState(specialist.phase)} />
+                          </span>
+                          <span className={css.memberText}>
+                            <span className={css.memberName}>
+                              <span className={css.memberNameText}>{specialist.name}</span>
+                            </span>
+                            <small>
+                              {t(specialistPhaseKey(specialist.phase))}
+                              {specialist.phase === 'queued' && specialist.position !== undefined && (
+                                <span className={css.memberModel}>{` · #${specialist.position + 1}`}</span>
+                              )}
+                            </small>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
               </>
             )}
           </div>

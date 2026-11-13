@@ -12,6 +12,7 @@ import z from '@deepseek-ai/schemastery'
 import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-config-editor'
+import { decidePlacement, probeEndpoint, type PlacementTarget } from './placement.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -28,6 +29,13 @@ export interface Config {
   model: Volatile<string>
   /** Adapter-owned reasoning effort; omission follows the provider default. */
   reasoningEffort: Volatile<string | undefined>
+  /**
+   * Placement targets for the default model, in priority order. Omission
+   * keeps the static default route without probing.
+   */
+  placement: Volatile<readonly PlacementTarget[] | undefined>
+  /** Per-probe timeout in milliseconds for placement endpoint probes. */
+  placementProbeTimeoutMs: Volatile<number>
 }
 
 /** Project stored settings onto the Agent-facing selection type. */
@@ -52,6 +60,11 @@ export class AgentDefaultModelConfig extends Service {
     provider: z.string().required().volatile(),
     model: z.string().required().volatile(),
     reasoningEffort: z.string().volatile(),
+    placement: z.array(z.object({
+      provider: z.string(),
+      endpoint: z.string(),
+    })).volatile(),
+    placementProbeTimeoutMs: z.number().step(1).min(1).default(2000).volatile(),
   })
 
   constructor(private readonly ownerContext: Context, private config: Config) {
@@ -70,6 +83,23 @@ export class AgentDefaultModelConfig extends Service {
       provider: this.config.provider.get(), model: this.config.model.get(),
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
     })
+  }
+
+  /**
+   * Read the default model selection placed on the first eligible placement
+   * endpoint. Without placement configuration the static default is returned
+   * unprobed. When no target is eligible the static default provider is kept
+   * so the request fails loudly on its normal provider error.
+   * @returns the default selection routed to the eligible provider.
+   */
+  async placedSelection(): Promise<ModelSelection> {
+    const current = this.currentSelection()
+    const targets = this.config.placement.get()
+    if (targets === undefined || targets.length === 0) return current
+    const timeoutMs = this.config.placementProbeTimeoutMs.get()
+    const evidence = await Promise.all(targets.map(target => probeEndpoint(target, timeoutMs)))
+    const { provider } = decidePlacement(targets, evidence, current.model, current.provider)
+    return { ...current, provider }
   }
 
   /**

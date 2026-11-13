@@ -52,8 +52,15 @@ With the tools installed, the model does the rest on request — for example, "c
 | `maxTasks` | `256` | Maximum active tasks on the board |
 | `maxMessageBytes` | `65,536` | Maximum size of one sent message |
 | `disposalTimeoutMs` | `5,000` | Time allowed for shutdown cleanup |
+| `specialists` | `[]` | Catalog of `{ name, description, prompt, provider? }` entries the tools offer by name |
+| `maxActiveSpecialists` | `4` | Maximum specialists of one Team running concurrently; the rest queue in FIFO order |
+| `routeLimits` | `[]` | Optional `{ provider, maxActive }` ceilings that further restrict one route |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-experimental-agent-team) is the exhaustive source for every accepted field and its JSDoc.
+
+### Specialists
+
+A specialist is a named catalog role the Lead can start repeatedly under a concurrency budget. Each catalog entry declares a durable `prompt` — the role contract that always leads the specialist's first message — and the Lead supplies the concrete work separately, so one role serves many assignments. Starting more specialists than `maxActiveSpecialists` queues them; a queued specialist starts automatically when an active one finishes, and `list_specialist_status` reports each one as `queued`, `working`, `finished`, or `cancelled`.
 
 ### Teammates
 

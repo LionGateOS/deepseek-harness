@@ -1,5 +1,5 @@
 ---
-description: "Nine tools that let the model create, message, and coordinate teammates, for compositions mounting the experimental Team plugins."
+description: "Twelve tools that let the model create, message, and coordinate teammates and specialists, for compositions mounting the experimental Team plugins."
 kind: "package-reference"
 ---
 
@@ -9,12 +9,13 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-This package lets the model create named teammates, send them messages, inspect availability, wait for progress, interrupt stuck work, and coordinate through a shared task board. Every team member receives the same nine tools and guidance for coordinating in a shared workspace. It replaces legacy subagent controls with the same tool names, so compositions that need both must disable the legacy definitions. The package is published under its experimental name and provides no stability guarantee.
+This package lets the model create named teammates, send them messages, inspect availability, wait for progress, interrupt stuck work, and coordinate through a shared task board. Every team member receives the same twelve tools and guidance for coordinating in a shared workspace, and the owner selects how eagerly the Lead delegates through the durable `/orchestrate` mode. It replaces legacy subagent controls with the same tool names, so compositions that need both must disable the legacy definitions. The package is published under its experimental name and provides no stability guarantee.
 
 ## Table of Contents
 
 - [Use this package](#use-this-package)
 - [Understand the implementation](#understand-the-implementation)
+- [Choose how eagerly the Lead delegates](#choose-how-eagerly-the-lead-delegates)
 - [Further Exploration](#further-exploration)
 - [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
@@ -25,7 +26,7 @@ This package lets the model create named teammates, send them messages, inspect 
 <a id="use-this-package"></a>
 ## Use this package
 
-Add this package on top of `@deepseek-ai/dsh-experimental-agent-team` when the model should run a team through tools. Once mounted, every team member — the Lead and each teammate — gets the same nine tools plus the same coordination policy. Each member receives its current role and name through required runtime context; `spawn_teammate` sends the initial task unchanged.
+Add this package on top of `@deepseek-ai/dsh-experimental-agent-team` when the model should run a team through tools. Once mounted, every team member — the Lead and each teammate — gets the same twelve tools plus the same coordination policy. Each member receives its current role and name through required runtime context; `spawn_teammate` sends the initial task unchanged.
 
 ### When to choose it
 
@@ -33,7 +34,7 @@ Choose it when the model should create and coordinate teammates by itself rather
 
 ### Smallest working example
 
-The smallest addition to an existing composition is the two-package fragment from the [agent-team README](../agent-team/README.md#smallest-working-setup): durable session storage, the team domain package, and this package. The plugin itself takes two optional settings:
+The smallest addition to an existing composition is the two-package fragment from the [agent-team README](../agent-team/README.md#smallest-working-setup): durable session storage, the team domain package, and this package. The plugin itself takes two optional settings; the orchestration mode is durable session state, not a deployment setting:
 
 ```yaml
 - id: tool-agent-team
@@ -52,14 +53,31 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 Try it by asking the Lead model: "create a teammate named reviewer to check the diff, then send reviewer the change summary". The model calls the creation tool and then the messaging tool.
 
+<a id="choose-how-eagerly-the-lead-delegates"></a>
+### Choose how eagerly the Lead delegates
+
+The owner sets the orchestration mode for the session with `/orchestrate`:
+
+```
+/orchestrate off      # no automatic delegation; explicit requests only
+/orchestrate auto     # the Lead judges whether a specialist pays off (default)
+/orchestrate on       # strongly prefer a useful specialist for non-trivial work
+/orchestrate status   # report the current mode
+```
+
+`auto` is the default, so a Session that never ran the command behaves as `auto` without logging a selection. The selection is durable: it is a plugin record in the Lead's Session log, folded by a projection, so it survives session resume and forks and is never derived from chat text. Only the Team Lead may set it; a teammate's attempt is refused. The mode changes delegation preference only — it never widens permissions, model-selection routes, concurrency, or authority, and `off` leaves every specialist tool mounted for explicit use.
+
 ### What the model can do
 
-The nine tools group into four capabilities:
+The twelve tools group into five capabilities:
 
 - **Create a teammate** — `spawn_teammate` takes a name, a description, and the initial task; only the Lead can call it.
 - **Send messages** — `send_message` steers a running member at its nearest step boundary, starts or resumes an inactive member.
 - **See and wait** — `list_agents` returns each member’s `target` and availability; `wait_agent` waits for the next team change; `interrupt_agent` stops a teammate's current turn (Lead only).
 - **Manage the task board** — `team_task_create`, `team_task_list`, `team_task_get`, and `team_task_update` add, browse, read, and update shared tasks.
+- **Run catalog specialists** — `list_specialists` lists the configured catalog, `list_specialist_status` reports each specialist's queue phase, and `spawn_specialist` starts one by `name` with a concrete `task` (Lead only).
+
+`spawn_specialist` takes two distinct inputs: `name` selects the catalog role, and `task` is the concrete work. The specialist always receives its catalog role text first, then the assignment as a separate block stating that the assignment does not extend permission scope or replace the role. A specialist that is queued starts with the same role and assignment once a slot opens.
 
 Creation and listing results identify members by `target`, with no member Session ID. Use that value in message and interrupt calls or the task tools’ `owner` parameter; task `ownerName` uses the same value. `inactive` means no turn is executing, whether the member is loaded or must be resumed; it does not describe task completion or outcome. `provisioning` and `failed` describe member creation. Any member can message any other member and use the task board; only the Lead creates and interrupts teammates. Task updates keep the domain's owner and revision checks, so an outdated edit is rejected instead of overwriting newer work.
 
@@ -91,11 +109,11 @@ The [Agent Teams Agent Note](../../../.agents/notes/implemented/feature/2026-08-
 
 | File | Role |
 |---|---|
-| [`src/index.ts`](src/index.ts) | Plugin entry: config, the fixed policy text, and the nine scoped tool registrations |
+| [`src/index.ts`](src/index.ts) | Plugin entry: config, the fixed policy text, and the twelve scoped tool registrations |
 
 ### Policy and tools
 
-One `team:policy` section on the member scope states the shared coordination rules; the fixed text and the nine tool registrations are declared in [`src/index.ts`](src/index.ts). The nine tool schemas are registered in scopes recognized as Team members at publication. Scoped registrations with the same names as the legacy global continuable-subagent controls shadow those globals for team members only.
+One `team:policy` section on the member scope states the shared coordination rules; the fixed text and the twelve tool registrations are declared in [`src/index.ts`](src/index.ts). The policy also states when specialist delegation is worth its cost and when it is not, so the Lead chooses a team from the task rather than from an instruction in the prompt. The twelve tool schemas are registered in scopes recognized as Team members at publication. Scoped registrations with the same names as the legacy global continuable-subagent controls shadow those globals for team members only.
 
 ### Scoped registration and teardown
 
@@ -124,7 +142,7 @@ Read these pages when the package-level contract is not enough. They move from t
 
 #### What the model sees
 
-One shared system policy covers Team availability, shared-cwd safety, task coordination, Steer delivery, inbox acceptance, and the Lead’s duty to wait. All nine schemas are identical for Leads and teammates; execution enforces Lead-only operations. Required runtime context states `You are the Team Lead named "lead".` or `You are teammate "<name>".` with `Your Team Lead is named "lead".`, plus roster and messaging instructions. Identity comes from current Team membership, survives optional-context suppression, and is restored when compaction removes its snapshot. An ordinary fork from a teammate receives its current Lead identity.
+One shared system policy covers Team availability, the owner-selected orchestration mode, shared-cwd safety, task coordination, Steer delivery, inbox acceptance, the Lead's duty to wait, and when to delegate to a catalog specialist. The delegation guidance names the work that justifies a specialist — independent verification, architecture or design review, security or safety audit, implementation and review separation, research and synthesis separation, parallel independent investigation — and the work that does not: trivial or single-step tasks, delegation that costs more to describe than to perform, duplicate assignments, and context that cannot be stated completely in the assignment. It keeps decomposition, specialist choice, result interpretation, and final synthesis with the Lead, and it states that an assignment selects work without widening a specialist's role, permissions, or route. The policy also renders the current orchestration mode and its guidance: `off` states that automatic delegation is disabled and that the specialist tools remain available for explicit manual use, `auto` asks the Lead to evaluate delegation for itself and prefer the smallest useful team, and `on` asks the Lead to strongly prefer a specialist for non-trivial work without spawning as many agents as possible. Every mode states that the mode changes delegation preference only and cannot widen filesystem permissions, model-selection permission, paid or cloud routes, concurrency limits, specialist role contracts, or session and tool permissions, and never authorizes recursive delegation. All twelve schemas are identical for Leads and teammates; execution enforces Lead-only operations. Required runtime context states `You are the Team Lead named "lead".` or `You are teammate "<name>".` with `Your Team Lead is named "lead".`, plus roster and messaging instructions. Identity comes from current Team membership, survives optional-context suppression, and is restored when compaction removes its snapshot. An ordinary fork from a teammate receives its current Lead identity.
 
 #### Token effect
 

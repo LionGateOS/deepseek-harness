@@ -2,16 +2,37 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import { TeamTaskId } from '@deepseek-ai/dsh-experimental-agent-team'
-import type { TeamMemberView } from '@deepseek-ai/dsh-experimental-agent-team'
+import type { TeamMemberView, StartSpecialistResult } from '@deepseek-ai/dsh-experimental-agent-team'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { InferValue, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import {
+  subagentModelSelectionProjectionDefinition,
+  subagentModelSelectionPolicy,
+  recordSubagentModelSelection,
+} from '@deepseek-ai/dsh-tool-subagent/src/model-selection-state.ts'
+import type { AllowedModelRoute, ModelSelectionPolicy } from '@deepseek-ai/dsh-tool-subagent/src/model-selection.ts'
+// Type-only: merge `ctx.subagentModelSelection`, `ctx.llm`, and `ctx.sessionProjections` into the Context interface.
+import type {} from '@deepseek-ai/dsh-tool-subagent/src/model-selection-settings.ts'
+import type {} from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-session-projection'
+// Type-only: merge the optional `ctx.commands` service so `/orchestrate` can register when composed.
+import type {} from '@deepseek-ai/dsh-commands'
+import {
+  orchestrationModeOf,
+  orchestrationModeProjectionDefinition,
+  parseOrchestrationMode,
+  recordOrchestrationMode,
+} from './orchestration-mode.ts'
+import type { OrchestrationMode } from './orchestration-mode.ts'
 
 /** Cordis plugin name. */
 export const name = 'tool-agent-team'
 /** Services required by the Team tool plugin. */
-export const inject = ['agents', 'agentTeams', 'tools', 'systemPrompt']
+export const inject = ['agents', 'agentTeams', 'tools', 'systemPrompt', 'sessionProjections']
 
 /** Tool routing configuration. */
 export interface Config {
@@ -30,9 +51,27 @@ export const Config: z<Config> = z.object({
   forkProvider: z.string().default('fork'),
 })
 
+/**
+ * Mode-dependent delegation guidance. The mode selects one paragraph; the rest of the
+ * Team policy is shared so a mode change cannot rewrite unrelated collaboration rules.
+ */
+const MODE_GUIDANCE: Readonly<Record<OrchestrationMode, string>> = {
+  off: 'Automatic specialist delegation is OFF for this Team. Work directly unless the owner explicitly asks you to delegate; the specialist tools remain available for that explicit, manual use. Do not start a specialist merely because a listed role happens to exist.',
+  auto: 'Automatic specialist delegation is AUTO for this Team, the normal setting. Evaluate for yourself whether a specialist provides meaningful expected benefit under the criteria above, and prefer the smallest useful team. Simple factual questions, tiny edits, and other single-step work stay with you.',
+  on: 'Automatic specialist delegation is ON for this Team. Strongly prefer a specialist for non-trivial work whenever a listed role fits it, and say which role and why. ON is a preference for useful delegation, not permission to spawn as many agents as possible: trivial or single-step work may still stay with you, and every limit stated here still applies.',
+}
+
 /** Model-facing collaboration guidance shared by Lead and teammates. */
-function teamPolicy(interrupt: boolean): string {
+function teamPolicy(interrupt: boolean, mode: OrchestrationMode): string {
   return `Agent Teams is available in this session
+
+Specialists are optional tools, not a required step. The catalog lists named roles you can start with spawn_specialist; each keeps its catalog role and receives the concrete work you pass in \`task\`. Delegation earns its cost when a distinct role adds independence or expertise you would not otherwise have: independently verifying finished work, reviewing architecture or design, auditing security or safety, separating implementation from review, separating research from synthesis, or investigating independent parts in parallel. It does not earn its cost when the task is trivial or single-step, when describing the work costs more than doing it, when the specialist would duplicate work already underway, or when the context it needs cannot be stated clearly and completely in \`task\`. Start the smallest team that covers the work; one specialist is often enough.
+
+As Team Lead you own the outcome. Decompose the task, choose the specialist that fits it, and write a \`task\` that states the concrete work plus the paths, acceptance criteria, and write scope the specialist needs to act without your conversation. Then read the result critically, reconcile conflicting findings, and write the final answer yourself; a specialist's output informs your judgement and does not replace it. \`task\` selects work and never widens a specialist's role, permissions, or route, and a specialist reporting that it cannot act within its fixed scope is reporting a real limit rather than requesting wider authority. Existing limits continue to apply: only the Team Lead can start specialists, the per-team concurrency cap and FIFO queue decide when a started specialist runs, and session route and model-selection policy still governs every specialist call. Do not plan work around nested delegation, because a teammate cannot start a specialist, and do not start several specialists on the same assignment.
+
+${MODE_GUIDANCE[mode]}
+
+The orchestration mode changes delegation preference only. It cannot widen filesystem permissions, model-selection permission, paid or cloud routes, concurrency limits, specialist role contracts, or session and tool permissions, and it never authorizes recursive delegation.
 
 The Team Lead and all teammates share the same working directory and filesystem. Edits are immediately visible to every member. Split write work into disjoint scopes, record expected write scopes on shared tasks, and use task dependencies when work must be ordered. Write-scope overlap is advisory, not a lock.
 
@@ -85,6 +124,43 @@ const TASK_VIEW_SCHEMA = {
     writeScopes: { type: 'array', required: true, items: { type: 'string' } },
     ready: { type: 'boolean', required: true },
     writeScopeWarnings: { type: 'array', required: true, items: { type: 'string' } },
+  },
+} as const
+
+const SPECIALIST_CATALOG_VALUE_SCHEMA = {
+  type: 'array',
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', required: true },
+      description: { type: 'string', required: true },
+    },
+  },
+} as const
+
+const SPECIALIST_STATUS_VALUE_SCHEMA = {
+  type: 'array',
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', required: true },
+      phase: { type: 'string', required: true, enum: ['queued', 'working', 'finished', 'cancelled'] },
+      position: { type: 'integer' },
+      provider: { type: 'string' },
+    },
+  },
+} as const
+
+const SPAWN_SPECIALIST_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    status: { type: 'string', required: true, enum: ['active', 'queued'] },
+    name: { type: 'string', required: true },
+    member: { ...MEMBER_VIEW_SCHEMA },
+    pending: { type: 'integer' },
   },
 } as const
 
@@ -157,6 +233,136 @@ function jsonOutput<const S extends ValueSchemaSpec>(schema: S): {
   }
 }
 
+/**
+ * Capture the session-bound model-selection policy for one Team member at
+ * composition time. Samples the global setting on first use and records it
+ * immutably in the session log; subsequent calls for the same session read
+ * from that record. Returns undefined when model selection is unavailable or
+ * disabled at the moment this session was composed.
+ * @param ctx - Team tool plugin context with sessionProjections and optional subagentModelSelection.
+ * @param agent - the Team member agent whose session receives the policy capture.
+ * @returns the session-bound selection policy, or undefined when disabled.
+ */
+function captureModelSelectionPolicy(ctx: Context, agent: Agent): ModelSelectionPolicy | undefined {
+  const selectionSvc = ctx.get('subagentModelSelection')
+  if (selectionSvc === undefined) return undefined
+  let allowedModels = subagentModelSelectionPolicy(ctx.sessionProjections, agent.session)
+  if (allowedModels === undefined) {
+    const current = selectionSvc.current()
+    if (!current.enabled) return undefined
+    allowedModels = current.allowedModels
+    recordSubagentModelSelection(ctx.sessionProjections, agent.session, allowedModels)
+  }
+  return { routes: allowedModels }
+}
+
+/**
+ * Validate model selection fields from a spawn_teammate call and return the
+ * resolved child AgentOptions, or `undefined` when no selection was requested.
+ * Rejects selection when disabled, unauthorized, incompatible with fork context,
+ * or when the LLM preflight reports an invalid route or effort.
+ * @param ctx - Team tool plugin context.
+ * @param agent - Exact live caller (the Team Lead Agent).
+ * @param policy - Session-bound model-selection policy captured at composition time.
+ * @param context - fresh or fork context mode.
+ * @param provider - Optional provider override from the model-facing call.
+ * @param model - Optional model override from the model-facing call.
+ * @param rawReasoningEffort - Optional reasoning-effort override from the model-facing call.
+ * @param signal - Caller cancellation signal.
+ * @returns Child AgentOptions if selection was requested, or undefined for pure inheritance.
+ */
+async function resolveTeammateAgentOptions(
+  ctx: Context,
+  agent: Agent,
+  policy: ModelSelectionPolicy | undefined,
+  context: 'fresh' | 'fork',
+  provider: string | undefined,
+  model: string | undefined,
+  rawReasoningEffort: string | undefined,
+  signal: AbortSignal,
+): Promise<AgentOptions | undefined> {
+  const hasProvider = provider !== undefined
+  const hasModel = model !== undefined
+  const hasEffort = rawReasoningEffort !== undefined
+
+  if (!hasProvider && !hasModel && !hasEffort) return undefined
+
+  if (hasProvider && provider.length === 0) throw new Error('child LLM `provider` must be non-empty')
+  if (hasModel && model.length === 0) throw new Error('child LLM `model` must be non-empty')
+  if (hasEffort && rawReasoningEffort.length === 0) throw new Error('child LLM `reasoning_effort` must be non-empty')
+
+  if (hasProvider !== hasModel) throw new Error('child LLM `provider` and `model` must be supplied together')
+
+  // Fork context inherits the parent route; route-changing overrides are not supported.
+  if (context === 'fork' && hasProvider) {
+    throw new Error('fork teammates inherit the parent route; `provider` and `model` cannot be changed')
+  }
+
+  // Authorization gate: model selection must be explicitly enabled with a non-empty allowlist.
+  // The policy is captured once at session composition time and is immutable per session;
+  // global setting changes after composition do not affect already-composed sessions.
+  if (policy === undefined) {
+    throw new Error('child model selection is disabled for this session')
+  }
+
+  // The effective parent route at delegation time, not the creation-time options.
+  // Uses the latest committed request header so a mid-session model switch is reflected.
+  const parentOptions = parentAgentOptionsForDelegation(agent)
+
+  // Allowlist gate: only required when the caller is selecting a new route.
+  // Effort-only overrides inherit the parent route and do not consult the allowlist.
+  if (hasProvider) {
+    if (!policy.routes.some((route: AllowedModelRoute) => route.provider === provider && route.model === model)) {
+      throw new Error(`child LLM route "${provider}/${model}" is not allowed for this Session`)
+    }
+  }
+
+  const resolvedEffort = hasEffort ? ReasoningEffortId(rawReasoningEffort) : undefined
+
+  if (provider !== undefined && model !== undefined) {
+    // Route-changing spawn: provider and model are narrowed to string.
+    const agentOptions: AgentOptions = {
+      provider,
+      model,
+      ...(resolvedEffort !== undefined ? { reasoningEffort: resolvedEffort } : {}),
+    }
+    // Preflight: validate the new route and optional effort. Fail closed if LLM unavailable.
+    const llm = ctx.get('llm')
+    if (llm === undefined) {
+      throw new Error('cannot resolve the selected child LLM route because the `llm` service is unavailable')
+    }
+    await llm.resolveCallConfig({
+      provider,
+      model,
+      ...(resolvedEffort !== undefined ? { reasoningEffort: resolvedEffort } : {}),
+    }, signal)
+    return agentOptions
+  }
+
+  // Effort-only: inherits the parent route. Requires a live parent route for preflight.
+  const inheritedProvider = parentOptions.provider
+  const inheritedModel = parentOptions.model
+  if (inheritedProvider === undefined || inheritedModel === undefined) {
+    throw new Error('cannot apply reasoning effort without an effective provider and model')
+  }
+  const agentOptions: AgentOptions = {
+    ...(resolvedEffort !== undefined ? { reasoningEffort: resolvedEffort } : {}),
+  }
+  // Preflight: validate the inherited route with the new effort. Fail closed if LLM unavailable.
+  if (resolvedEffort !== undefined) {
+    const llm = ctx.get('llm')
+    if (llm === undefined) {
+      throw new Error('cannot resolve the selected child LLM route because the `llm` service is unavailable')
+    }
+    await llm.resolveCallConfig({
+      provider: inheritedProvider,
+      model: inheritedModel,
+      reasoningEffort: resolvedEffort,
+    }, signal)
+  }
+  return agentOptions
+}
+
 /** Recover the exact caller guaranteed by Agent-scoped tool discovery. */
 function callingAgent(agent: Agent | undefined, toolName: string): Agent {
   /* v8 ignore next 2 -- Team tools are registered only in an exact Agent scope, so discovery supplies this carrier. */
@@ -167,13 +373,19 @@ function callingAgent(agent: Agent | undefined, toolName: string): Agent {
 /** Register the complete Team tool set in one exact Agent scope. */
 function install(agent: Agent, ctx: Context, config: Required<Config>): () => void {
   const scoped = agent.ctx
+  // Capture the session-bound policy once at composition time. The closed-over value is
+  // immutable for the agent's lifetime; global setting changes do not reach open sessions.
+  const teamSelectionPolicy = captureModelSelectionPolicy(ctx, agent)
+  // The mode is durable state of the Team, not of one member: every member reads the
+  // Lead's log, so the rendered policy stays identical across the Team at any moment.
+  const teamSession = ctx.agentTeams.membership(agent).root.session
   const disposers: Array<() => unknown> = []
   const register = (disposer: () => unknown): void => { disposers.push(disposer) }
   try {
     register(scoped.systemPrompt.section({
       name: 'team:policy',
       order: scoped.systemPrompt.getSectionOrder('TEAM_POLICY'),
-      text: teamPolicy(config.interrupt),
+      text: () => teamPolicy(config.interrupt, orchestrationModeOf(ctx.sessionProjections, teamSession)),
     }))
     register(scoped.systemPrompt.context({
       name: 'team:identity',
@@ -201,17 +413,35 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
           enum: ['fresh', 'fork'],
           description: 'fresh starts without Lead history; fork inherits completed Lead turns. Defaults to fresh.',
         },
+        provider: {
+          type: 'string',
+          description: 'LLM provider id for this teammate. Requires model selection to be enabled. Must be supplied with model.',
+        },
+        model: {
+          type: 'string',
+          description: 'Exact model id for this teammate. Requires model selection to be enabled. Must be supplied with provider.',
+        },
+        reasoning_effort: {
+          type: 'string',
+          description: 'Reasoning effort for this teammate. Requires model selection to be enabled. Omitting on a route change lets the selected model use its own default.',
+        },
       },
       output: jsonOutput(SPAWN_VALUE_SCHEMA),
       async execute(args, exec) {
         const agent = callingAgent(exec.agent, 'spawn_teammate')
         const context = args.context ?? 'fresh'
+        const agentOptions = await resolveTeammateAgentOptions(
+          ctx, agent, teamSelectionPolicy, context,
+          args.provider, args.model, args.reasoning_effort,
+          exec.signal,
+        )
         const result = await ctx.agentTeams.spawnTeammate(agent, {
           name: args.name,
           description: args.description,
           prompt: [{ type: 'text', text: args.prompt }],
           context,
           provider: context === 'fork' ? config.forkProvider : config.freshProvider,
+          ...agentOptions !== undefined ? { agentOptions } : {},
           signal: exec.signal,
         })
         return { member: modelMember(result.member) }
@@ -398,6 +628,83 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
         })
       },
     })))
+    register(scoped.tools.register(defineTool({
+      name: 'list_specialists',
+      description: 'List the available specialist catalog entries. Use spawn_specialist to start one by name.',
+      parameters: {},
+      output: jsonOutput(SPECIALIST_CATALOG_VALUE_SCHEMA),
+      execute(_args, _exec) {
+        return Promise.resolve(
+          ctx.agentTeams.specialists.map(({ name, description }) => ({ name, description })),
+        )
+      },
+    })))
+
+    register(scoped.tools.register(defineTool({
+      name: 'list_specialist_status',
+      description: 'List the current scheduling phase and queue position for all specialists started in this session. Only the Team Lead may call this tool.',
+      parameters: {},
+      output: jsonOutput(SPECIALIST_STATUS_VALUE_SCHEMA),
+      execute(_args, exec) {
+        const agent = callingAgent(exec.agent, 'list_specialist_status')
+        const view = ctx.agentTeams.listSpecialistStatus(agent)
+        return Promise.resolve(view.specialists)
+      },
+    })))
+
+    register(scoped.tools.register(defineTool({
+      name: 'spawn_specialist',
+      description: 'Start one specialist from the catalog and give it a concrete assignment. `name` selects the specialist role; `task` is the work that specialist must perform. The specialist keeps its catalog role and receives `task` as its assignment. If the per-team concurrency limit is reached the specialist is queued and starts automatically when a slot opens. Only the Team Lead may call this tool.',
+      parameters: {
+        name: { type: 'string', required: true, description: 'Specialist role to start, from list_specialists.' },
+        task: {
+          type: 'string',
+          required: true,
+          description: 'Concrete work this specialist must perform. Include enough context to act without the Lead conversation, such as paths, goals, acceptance criteria, and any write scope you expect it to own.',
+        },
+        provider: {
+          type: 'string',
+          description: 'Optional approved LLM provider route for this specialist. Must be supplied together with model.',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional approved LLM model for this specialist. Must be supplied together with provider.',
+        },
+        reasoning_effort: {
+          type: 'string',
+          description: 'Optional reasoning-effort override for the specialist.',
+        },
+      },
+      output: jsonOutput(SPAWN_SPECIALIST_VALUE_SCHEMA),
+      async execute(args, exec) {
+        const agent = callingAgent(exec.agent, 'spawn_specialist')
+        const agentOptions = await resolveTeammateAgentOptions(
+          ctx,
+          agent,
+          teamSelectionPolicy,
+          'fresh',
+          args.provider,
+          args.model,
+          args.reasoning_effort,
+          exec.signal,
+        )
+        const result: StartSpecialistResult = await ctx.agentTeams.startSpecialist(agent, {
+          name: args.name,
+          task: args.task,
+          provider: config.freshProvider,
+          ...(agentOptions !== undefined ? { agentOptions } : {}),
+          signal: exec.signal,
+        })
+        if (result.member !== undefined) {
+          return { status: result.status, name: result.name, member: modelMember(result.member) }
+        }
+        return {
+          status: result.status,
+          name: result.name,
+          ...result.pending !== undefined ? { pending: result.pending } : {},
+        }
+      },
+    })))
   } catch (error: unknown) {
     for (const dispose of disposers.reverse()) void dispose()
     throw error
@@ -409,6 +716,10 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
 
 /** Install Team tools in every live or subsequently published Team member scope. */
 export function apply(ctx: Context, config: Config = {}): void {
+  // Register the model-selection projection so captureModelSelectionPolicy can read
+  // the session-bound policy. Registration is ref-counted and safe across HMR cycles.
+  ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
+  ctx.sessionProjections.register(orchestrationModeProjectionDefinition)
   const resolved: Required<Config> = {
     interrupt: config.interrupt ?? true,
     freshProvider: config.freshProvider ?? 'spawn',
@@ -429,4 +740,41 @@ export function apply(ctx: Context, config: Config = {}): void {
     for (const dispose of installed.values()) dispose()
     installed.clear()
   }, 'tool-team.scopedTools()')
+  registerOrchestrationCommand(ctx)
+}
+
+/**
+ * Register `/orchestrate` when a command registry is composed. The registry is optional,
+ * so the plugin keeps working without it; the mode is then only readable through its projection.
+ * @param ctx - plugin context that owns the optional command registration.
+ */
+function registerOrchestrationCommand(ctx: Context): void {
+  ctx.inject(['commands'], (commandCtx) => {
+    commandCtx.commands.register({
+      name: 'orchestrate',
+      description: 'Select or show the Team orchestration mode',
+      input: { hint: '[off|auto|on|status]' },
+      handler: ({ agent, rawInput }) => {
+        const member = ctx.agentTeams.tryMembership(agent)
+        if (member === undefined) {
+          return { kind: 'error', text: 'Orchestration mode applies to an Agent Team; this session is not a Team member.' }
+        }
+        const requested = rawInput.trim().toLowerCase()
+        if (requested === '' || requested === 'status') {
+          return { kind: 'success', text: `Orchestration mode is ${orchestrationModeOf(ctx.sessionProjections, member.root.session)}.` }
+        }
+        const mode = parseOrchestrationMode(requested)
+        if (mode === undefined) {
+          return { kind: 'error', text: `Unknown orchestration mode "${rawInput.trim()}". Use off, auto, on, or status.` }
+        }
+        if (member.role !== 'lead') {
+          return { kind: 'error', text: 'Only the Team Lead can change the orchestration mode.' }
+        }
+        const current = orchestrationModeOf(ctx.sessionProjections, member.root.session)
+        if (current === mode) return { kind: 'success', text: `Orchestration mode is already ${mode}.` }
+        recordOrchestrationMode(member.root.session, mode)
+        return { kind: 'success', text: `Orchestration mode set to ${mode}.` }
+      },
+    })
+  })
 }

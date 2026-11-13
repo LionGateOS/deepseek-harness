@@ -1,6 +1,6 @@
 /** Public Agent Teams identities, durable records, and service request values. */
 
-import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import type { MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm/brand'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -149,6 +149,14 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+/** Per-route specialist concurrency ceiling, applied together with maxActiveSpecialists. */
+export interface RouteLimit {
+  /** Provider route identifier matching SpawnTeammateRequest.provider. */
+  readonly provider: string
+  /** Maximum concurrently active specialists on this route. */
+  readonly maxActive: number
+}
+
 /** Team-service deployment limits. */
 export interface Config {
   /** Maximum immutable teammate names retained by one Team. */
@@ -159,6 +167,69 @@ export interface Config {
   readonly maxMessageBytes?: number
   /** Maximum milliseconds for shared operation settlement and for each Team child drain. */
   readonly disposalTimeoutMs?: number
+  /** Specialist catalog; spawn_specialist selects from this list by name. */
+  readonly specialists?: SpecialistDefinition[]
+  /** Maximum concurrently active specialists per Team. Defaults to 4. */
+  readonly maxActiveSpecialists?: number
+  /**
+   * Optional per-route concurrency ceilings. Each entry further restricts the
+   * maxActiveSpecialists budget for one provider route. No entry means no route-
+   * specific restriction. The effective admission decision respects both ceilings.
+   */
+  readonly routeLimits?: RouteLimit[]
+}
+
+/** Lifecycle phase for a specialist managed by the scheduling queue. */
+export type SpecialistPhase = 'queued' | 'working' | 'finished' | 'cancelled'
+
+/** One specialist's scheduling state surfaced through the agentTeamSpecialists projection. */
+export interface SpecialistStatusSnapshot {
+  readonly name: string
+  readonly phase: SpecialistPhase
+  /** Queue depth ahead of this entry; present only when phase is 'queued'. */
+  readonly position?: number
+  /** Provider route; present once known. */
+  readonly provider?: string
+}
+
+/** Wire view of specialist scheduling state projected to browser clients. */
+export interface SpecialistQueueView {
+  readonly specialists: SpecialistStatusSnapshot[]
+}
+
+/**
+ * One entry in the specialist catalog. Specialists are pre-configured agent
+ * templates; the Lead selects entries by name and the Team service manages
+ * their concurrency under {@link Config.maxActiveSpecialists}.
+ */
+export interface SpecialistDefinition {
+  /** Unique kebab-case name identifying this specialist. */
+  readonly name: string
+  /** Short description of the specialist's role, surfaced by list_specialists. */
+  readonly description: string
+  /**
+   * Durable role contract, sent as the specialist's leading prompt. It defines
+   * how the specialist works and is never replaced by a Lead assignment.
+   */
+  readonly prompt: string
+  /** Provider route override; inherits freshProvider from tool config when omitted. */
+  readonly provider?: string
+}
+
+/**
+ * Provider, model, and inference overrides for a spawned teammate.
+ * Structurally identical to `AgentOptions` from `dsh-agent`; defined here
+ * to keep `types.ts` free of host-only context augmentations.
+ */
+export interface TeammateAgentOptions {
+  /** Provider route for the teammate (must be registered at spawn time). */
+  provider?: string
+  /** Model id for the teammate, interpreted by the selected provider. */
+  model?: string
+  /** Adapter-owned reasoning effort for the selected provider/model route. */
+  reasoningEffort?: ReasoningEffortId
+  /** Maximum output tokens per conversation-model request. */
+  maxTokens?: number
 }
 
 /** Input for creating one durable teammate. */
@@ -168,12 +239,51 @@ export interface SpawnTeammateRequest {
   readonly prompt: ContentBlock[]
   readonly context: 'fresh' | 'fork'
   readonly provider: string
+  /**
+   * Optional provider, model, reasoning-effort, and output-token overrides for the child.
+   * Requires the backing subagent provider to advertise `agentOptions` capability.
+   * Omission inherits the parent's current route. For fork context, route-changing
+   * overrides (provider or model) are rejected; effort-only overrides are accepted.
+   */
+  readonly agentOptions?: TeammateAgentOptions
   readonly signal: AbortSignal
 }
 
 /** Result after one teammate reaches a durable active or failed edge. */
 export interface SpawnTeammateResult {
   readonly member: TeamMemberView
+}
+
+/** Request to start or queue one specialist job. */
+export interface StartSpecialistRequest {
+  /** Specialist name from the catalog. */
+  readonly name: string
+  /**
+   * Concrete work this specialist must perform. Appended to the catalog role
+   * prompt as a separate assignment; omission starts the specialist with its
+   * role contract alone.
+   */
+  readonly task?: string
+  /** Provider route for the specialist; used when the catalog entry omits one. */
+  readonly provider: string
+  /**
+   * Optional validated child LLM route/inference overrides.
+   * Uses the same AgentOptions contract as direct teammate spawning.
+   */
+  readonly agentOptions?: TeammateAgentOptions
+  readonly signal: AbortSignal
+}
+
+/** Result of a start-or-queue specialist call. */
+export interface StartSpecialistResult {
+  /** 'active' when started immediately into a slot; 'queued' when waiting for a slot. */
+  readonly status: 'active' | 'queued'
+  /** Specialist name as confirmed from the catalog. */
+  readonly name: string
+  /** Runtime member row; set only when status is 'active'. */
+  readonly member?: TeamMemberView
+  /** Number of pending queued specialists when status is 'queued'. */
+  readonly pending?: number
 }
 
 /** Input for one direct peer-message attempt. */
@@ -239,5 +349,20 @@ declare module '@deepseek-ai/dsh-session/types' {
       messageId: TeamMessageId
       targetId: SessionId
     }
+    /** Specialist entered the FIFO queue waiting for a concurrency slot. */
+    'team/specialist/queued': { version: 1; teamId: TeamId; name: string; provider: string; position: number }
+    /** Specialist left the queue and started provisioning (slot claimed). */
+    'team/specialist/promoted': { version: 1; teamId: TeamId; name: string }
+    /** Queued specialist was cancelled before it could be promoted. */
+    'team/specialist/cancelled': { version: 1; teamId: TeamId; name: string }
+    /** Specialist session disposed; marks the end of the specialist's lifecycle. */
+    'team/specialist/finished': { version: 1; teamId: TeamId; name: string }
+  }
+}
+
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    /** Specialist scheduling phases derived from the team/specialist/* event stream. */
+    agentTeamSpecialists: import('./specialist-projection.ts').SpecialistQueueState
   }
 }

@@ -3,10 +3,16 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEventMap, SessionId } from '@deepseek-ai/dsh-session'
-import type { TeamEventType, TeamState } from './projection.ts'
+import type { TeamState } from './projection.ts'
 
-type AppendTeamEvent = <T extends TeamEventType>(type: T, data: SessionEventMap[T]) => void
-type MutableTeamEventType = 'team/member' | 'team/task'
+type AppendTeamEvent = <T extends keyof SessionEventMap>(type: T, data: SessionEventMap[T]) => void
+type MutableTeamEventType =
+  | 'team/member'
+  | 'team/task'
+  | 'team/specialist/queued'
+  | 'team/specialist/promoted'
+  | 'team/specialist/cancelled'
+  | 'team/specialist/finished'
 
 /** Owns per-Lead transaction order and committed Team event publication. */
 export class TeamJournal {
