@@ -81,7 +81,12 @@ afterEach(async () => {
 /** Boot the full continuable stack: loop, persistence, providers, and subagents. */
 async function setupWith(
   adapter: LlmAdapter,
-  options: { persistence?: boolean; sessionQuery?: boolean; maxActiveSubagents?: number } = {},
+  options: {
+    persistence?: boolean
+    sessionQuery?: boolean
+    maxActiveSubagents?: number
+    maxGlobalActiveSubagents?: number
+  } = {},
 ) {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
@@ -100,8 +105,10 @@ async function setupWith(
   await ctx.plugin(AgentLoop, { agents: [] })
   if (options.sessionQuery !== false) await ctx.plugin(TestSessionQuery)
   await mountWorkingDirectoryFixture(ctx)
-  subagentConfigs.set(ctx, await liveConfig(ctx, SubagentRuntime,
-    options.maxActiveSubagents === undefined ? {} : { maxActiveSubagents: options.maxActiveSubagents }))
+  subagentConfigs.set(ctx, await liveConfig(ctx, SubagentRuntime, {
+    ...(options.maxActiveSubagents === undefined ? {} : { maxActiveSubagents: options.maxActiveSubagents }),
+    ...(options.maxGlobalActiveSubagents === undefined ? {} : { maxGlobalActiveSubagents: options.maxGlobalActiveSubagents }),
+  }))
   await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
   await ctx.plugin(SubagentFork, { providerName: 'fork' })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -283,6 +290,7 @@ describe('continuable activation capacity', () => {
       await expect(subagentConfigs.get(ctx)!.update({ maxDepth: -1 })).rejects.toThrow()
       await expect(subagentConfigs.get(ctx)!.update({ maxDepth: 1.5 })).rejects.toThrow()
       await expect(subagentConfigs.get(ctx)!.update({ maxActiveSubagents: 0 })).rejects.toThrow()
+      await expect(subagentConfigs.get(ctx)!.update({ maxGlobalActiveSubagents: 0 })).rejects.toThrow()
       expect(ctx.subagents.resolveMaxDepth()).toBe(0)
       await subagentConfigs.get(ctx)!.replace({ maxDepth: 4 })
       expect(ctx.subagents.resolveMaxDepth()).toBe(4)
@@ -370,6 +378,89 @@ describe('continuable activation capacity', () => {
       await Promise.all([first, nested, sibling, independent].map(entry => waitNoActivation(ctx, entry.childId)))
     } finally {
       releaseParent.resolve(undefined)
+      release.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('enforces one global ceiling across independent roots', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter(Array.from({ length: 4 }, () => ({
+      chunks: textResponse('done'), gate: release.promise,
+    })))
+    const { ctx, parent } = await setupWith(adapter, {
+      maxActiveSubagents: 3,
+      maxGlobalActiveSubagents: 3,
+    })
+    const other = await ctx.agentLoop.create(SessionId('global-other-root'), { provider: 'mock', model: 'mock' })
+    parkParent(ctx, parent)
+    parkParent(ctx, other)
+    try {
+      const first = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+      const second = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+      const independent = await ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' })
+      await expect(ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' }))
+        .rejects.toMatchObject({ code: 'GLOBAL_ACTIVATION_LIMIT_REACHED' })
+      release.resolve(undefined)
+      await Promise.all([first, second, independent].map(entry => waitNoActivation(ctx, entry.childId)))
+      const replacement = await ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' })
+      await waitNoActivation(ctx, replacement.childId)
+    } finally {
+      release.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('returns the root slot after global rejection', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter(Array.from({ length: 3 }, () => ({
+      chunks: textResponse('done'), gate: release.promise,
+    })))
+    const { ctx, parent } = await setupWith(adapter, {
+      maxActiveSubagents: 1,
+      maxGlobalActiveSubagents: 1,
+    })
+    const other = await ctx.agentLoop.create(SessionId('global-rollback-root'), { provider: 'mock', model: 'mock' })
+    parkParent(ctx, parent)
+    parkParent(ctx, other)
+    try {
+      const first = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+      await expect(ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' }))
+        .rejects.toMatchObject({ code: 'GLOBAL_ACTIVATION_LIMIT_REACHED' })
+      release.resolve(undefined)
+      await waitNoActivation(ctx, first.childId)
+      const next = await ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' })
+      await waitNoActivation(ctx, next.childId)
+    } finally {
+      release.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('honors volatile global capacity changes without evicting residents', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter(Array.from({ length: 3 }, () => ({
+      chunks: textResponse('done'), gate: release.promise,
+    })))
+    const { ctx, parent } = await setupWith(adapter, {
+      maxActiveSubagents: 3,
+      maxGlobalActiveSubagents: 1,
+    })
+    const other = await ctx.agentLoop.create(SessionId('global-edit-root'), { provider: 'mock', model: 'mock' })
+    parkParent(ctx, parent)
+    parkParent(ctx, other)
+    try {
+      const first = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+      await expect(ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' }))
+        .rejects.toMatchObject({ code: 'GLOBAL_ACTIVATION_LIMIT_REACHED' })
+      await subagentConfigs.get(ctx)!.update({ maxGlobalActiveSubagents: 2 })
+      const second = await ctx.subagents.startActivation({ ...startSpec(other), delivery: 'parent' })
+      await subagentConfigs.get(ctx)!.update({ maxGlobalActiveSubagents: 1 })
+      await expect(ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' }))
+        .rejects.toMatchObject({ code: 'GLOBAL_ACTIVATION_LIMIT_REACHED' })
+      release.resolve(undefined)
+      await Promise.all([first, second].map(entry => waitNoActivation(ctx, entry.childId)))
+    } finally {
       release.resolve(undefined)
       await ctx.fiber.dispose()
     }

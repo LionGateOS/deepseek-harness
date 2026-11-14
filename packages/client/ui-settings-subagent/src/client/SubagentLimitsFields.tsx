@@ -51,6 +51,15 @@ export function SubagentLimitsFields(props: SubagentLimitsFieldsProps) {
             numeric disabled={!state.writable || state.saving} {...state.maxActiveSubagents}
             onEdit={(text) => { props.edit('maxActiveSubagents', text) }} onReset={() => { props.resetField('maxActiveSubagents') }} />
         </div>
+        <div className={css.limit}>
+          <SettingsValueField id="plugin-config-subagent-global-capacity" label={t('subagentMaxGlobalActive')}
+            help={{ label: t('subagentGlobalCapacityHelpLabel'), content: <p>{t('subagentGlobalCapacityHelp')}</p> }}
+            overriddenLabel={t('overridden')} resetLabel={t('reset')}
+            invalidLabel={t('subagentCapacityInvalid')}
+            numeric disabled={!state.writable || state.saving} {...state.maxGlobalActiveSubagents}
+            onEdit={(text) => { props.edit('maxGlobalActiveSubagents', text) }}
+            onReset={() => { props.resetField('maxGlobalActiveSubagents') }} />
+        </div>
       </div>
     </>
   )

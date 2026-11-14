@@ -10,12 +10,14 @@ import {
 export interface SubagentLimitsSettings {
   maxDepth: number
   maxActiveSubagents: number
+  maxGlobalActiveSubagents: number
 }
 
 /** Effective values and drafts presented by the limits card. */
 export interface SubagentLimitsCardState extends SettingsFormShell {
   maxDepth: SettingsFieldState
   maxActiveSubagents: SettingsFieldState
+  maxGlobalActiveSubagents: SettingsFieldState
 }
 
 /** Actions and observable state bound by the slot renderer. */
@@ -45,11 +47,12 @@ export class SubagentLimitsCardController {
 
   /** @param scope - The Host's `subagent` settings section. */
   constructor(scope: SettingsFormScope<SubagentLimitsSettings>) {
-    this.form = new SettingsFormModel(scope, [limitField('maxDepth', 0), limitField('maxActiveSubagents', 1)])
+    this.form = new SettingsFormModel(scope, [limitField('maxDepth', 0), limitField('maxActiveSubagents', 1), limitField('maxGlobalActiveSubagents', 1)])
     this.store = this.form.bind(() => ({
       ...this.form.shell(),
       maxDepth: this.form.field('maxDepth'),
       maxActiveSubagents: this.form.field('maxActiveSubagents'),
+      maxGlobalActiveSubagents: this.form.field('maxGlobalActiveSubagents'),
     }))
   }
 

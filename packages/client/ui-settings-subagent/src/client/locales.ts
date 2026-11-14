@@ -11,6 +11,7 @@ export type SubagentSettingsLocaleKey =
   | 'subagentDepthHelpLabel' | 'subagentDepthHelp'
   | 'subagentDepthZero' | 'subagentDepthOne' | 'subagentDepthOverride'
   | 'subagentMaxActive'
+  | 'subagentMaxGlobalActive' | 'subagentGlobalCapacityHelpLabel' | 'subagentGlobalCapacityHelp'
   | 'subagentCapacityHelpLabel' | 'subagentCapacityHelp'
   | 'subagentDepthInvalid'
   | 'subagentCapacityInvalid'
@@ -40,6 +41,9 @@ export const en: Record<SubagentSettingsLocaleKey, string> = {
   subagentDepthOne: 'Only the main Agent can create Subagents',
   subagentDepthOverride: 'If a tool defines its own maximum recursion depth, that setting takes precedence.',
   subagentMaxActive: 'Subagent parallelism limit',
+  subagentMaxGlobalActive: 'Global Subagent parallelism limit',
+  subagentGlobalCapacityHelpLabel: 'About the global Subagent limit',
+  subagentGlobalCapacityHelp: 'Maximum live Subagents across all main Agents using this manager. Each main Agent also retains its own limit. New starts are rejected when either limit is reached.',
   subagentCapacityHelpLabel: 'About the Subagent parallelism limit',
   subagentCapacityHelp: 'Total live Subagents under the same main Agent, across all recursion levels. The main Agent is excluded. New start requests are rejected when the limit is reached.',
   subagentDepthInvalid: 'Enter a whole number of 0 or more.',
@@ -79,6 +83,9 @@ export const zh: Record<SubagentSettingsLocaleKey, string> = {
   subagentDepthOne: '仅允许主 Agent 创建子智能体',
   subagentDepthOverride: '如果某个工具单独设置了最大递归深度，以该工具的设置为准。',
   subagentMaxActive: '子智能体并行数量上限',
+  subagentMaxGlobalActive: '全局子智能体并行数量上限',
+  subagentGlobalCapacityHelpLabel: '全局子智能体数量上限说明',
+  subagentGlobalCapacityHelp: '限制同一管理器内所有主 Agent 的子智能体总数。每个主 Agent 的独立上限仍然有效，达到任一上限时拒绝新启动。',
   subagentCapacityHelpLabel: '子智能体并行数量上限说明',
   subagentCapacityHelp: '同一主 Agent 下，所有递归层级同时存活的子智能体总数，主 Agent 不计入。达到上限时，新的启动请求会被拒绝。',
   subagentDepthInvalid: '请输入不小于 0 的整数。',

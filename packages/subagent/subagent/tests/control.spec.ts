@@ -272,6 +272,7 @@ describe('subagent prompt Remote', () => {
       ['DRAINING', 'subagent/delivery-unavailable'],
       ['ACTIVATION_CLOSING', 'subagent/delivery-unavailable'],
       ['ACTIVATION_LIMIT_REACHED', 'subagent/delivery-unavailable'],
+      ['GLOBAL_ACTIVATION_LIMIT_REACHED', 'subagent/delivery-unavailable'],
       ['NO_PROVIDER', 'gateway/internal'],
     ]
     for (const [thrown, code] of cases) {

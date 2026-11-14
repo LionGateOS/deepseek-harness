@@ -132,6 +132,8 @@ export class SubagentManager {
   private readonly resident = new Map<SessionId, Activation>()
   /** Root identities retain their pool across child settlement without retaining dead roots. */
   private readonly rootPools = new WeakMap<Agent, ActivationPool>()
+  /** One admission budget for all roots using this manager. */
+  private readonly globalPool = new ActivationPool()
   /** Materializations admitted before drain, tracked through publication or rollback. */
   private readonly materializations = new Set<Materialization>()
   /** Per-child serializer shared by delivery, release, and disposal. */
@@ -157,6 +159,7 @@ export class SubagentManager {
     private readonly ctx: Context,
     private readonly host: SubagentHost,
     private readonly maxActiveSubagents: () => number,
+    private readonly maxGlobalActiveSubagents: () => number,
   ) {
     // Ordinary Cordis owner effects unwind in reverse registration order, which
     // cannot express the dynamic child graph. Register the private scope's
@@ -741,7 +744,27 @@ export class SubagentManager {
     inputs.signal.throwIfAborted()
     const lineage = this.liveLineage(inputs.parent)
     const pool = this.resident.get(inputs.parent.id)?.pool ?? this.rootPool(inputs.parent)
-    const releaseSlot = pool.reserve(this.maxActiveSubagents())
+    // Keep the historical per-root rejection precedence when both ceilings bind.
+    const releaseRootSlot = pool.reserve(this.maxActiveSubagents())
+    const globalCapacity = this.maxGlobalActiveSubagents()
+    let releaseGlobalSlot: () => void
+    try {
+      releaseGlobalSlot = this.globalPool.reserve(globalCapacity)
+    } catch (error: unknown) {
+      releaseRootSlot()
+      if (error instanceof SubagentError && error.code === 'ACTIVATION_LIMIT_REACHED') {
+        throw new SubagentError(
+          `global subagent limit reached (active child limit: ${globalCapacity}); wait for an existing child to finish`,
+          'GLOBAL_ACTIVATION_LIMIT_REACHED',
+          { cause: error },
+        )
+      }
+      throw error
+    }
+    const releaseSlot = (): void => {
+      releaseGlobalSlot()
+      releaseRootSlot()
+    }
     const settled = Promise.withResolvers<void>()
     const controller = new AbortController()
     const materialization: Materialization = {

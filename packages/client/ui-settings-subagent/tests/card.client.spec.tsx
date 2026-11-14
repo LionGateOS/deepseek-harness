@@ -40,6 +40,7 @@ function renderSubagent(
     ...settled,
     maxDepth: field('3'),
     maxActiveSubagents: field('8'),
+    maxGlobalActiveSubagents: field('8'),
     ...limitState,
   })
   const models = createSnapshotStore<SubagentModelSelectionCardState>({
@@ -236,14 +237,17 @@ describe('SubagentCard', () => {
       dirty: true,
       maxDepth: field('3', { overridden: true }),
       maxActiveSubagents: field('8', { overridden: true }),
+      maxGlobalActiveSubagents: field('8', { overridden: true }),
     })
     fireEvent.change(screen.getByLabelText(en.subagentMaxDepth), { target: { value: '2' } })
     fireEvent.change(screen.getByLabelText(en.subagentMaxActive), { target: { value: '12' } })
-    expect(actions.editLimit.mock.calls).toEqual([['maxDepth', '2'], ['maxActiveSubagents', '12']])
+    fireEvent.change(screen.getByLabelText(en.subagentMaxGlobalActive), { target: { value: '16' } })
+    expect(actions.editLimit.mock.calls).toEqual([['maxDepth', '2'], ['maxActiveSubagents', '12'], ['maxGlobalActiveSubagents', '16']])
     for (const button of screen.getAllByRole('button', { name: en.reset })) fireEvent.click(button)
-    expect(actions.resetLimit.mock.calls).toEqual([['maxDepth'], ['maxActiveSubagents']])
+    expect(actions.resetLimit.mock.calls).toEqual([['maxDepth'], ['maxActiveSubagents'], ['maxGlobalActiveSubagents']])
     act(() => { limits.set({ ...limits.getSnapshot(), writable: false }) })
     expect(screen.getByLabelText(en.subagentMaxActive)).toHaveProperty('disabled', true)
+    expect(screen.getByLabelText(en.subagentMaxGlobalActive)).toHaveProperty('disabled', true)
   })
 
   it('blocks saving both sections when a model selection is invalid or conflicted', () => {
