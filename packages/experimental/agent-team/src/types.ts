@@ -167,6 +167,13 @@ export interface Config {
   readonly maxMessageBytes?: number
   /** Maximum milliseconds for shared operation settlement and for each Team child drain. */
   readonly disposalTimeoutMs?: number
+  /**
+   * Optional wall-clock budget for delegated Team work, in milliseconds.
+   * The clock starts at the first durable teammate/specialist creation event.
+   * Omission disables the leash. Expiry blocks new child work at safe
+   * boundaries; it does not interrupt a model request already in progress.
+   */
+  readonly maxTeamRuntimeMs?: number
   /** Specialist catalog; spawn_specialist selects from this list by name. */
   readonly specialists?: SpecialistDefinition[]
   /** Maximum concurrently active specialists per Team. Defaults to 4. */

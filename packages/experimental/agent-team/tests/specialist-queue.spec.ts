@@ -334,6 +334,32 @@ describe('SpecialistQueue', () => {
     })
   })
 
+  it('cancels queued specialists instead of promoting them after admission closes', async () => {
+    const resolvers: Array<(value: SpawnTeammateResult) => void> = []
+    const spawnFn = vi.fn().mockImplementation(() =>
+      new Promise<SpawnTeammateResult>((resolve) => { resolvers.push(resolve) }),
+    )
+    const onCancelled = vi.fn()
+    const canPromote = vi.fn().mockReturnValue(false)
+    const queue = new SpecialistQueue(1, spawnFn, [], { canPromote, onCancelled })
+    const teamId = TeamId('team-expired')
+
+    const first = queue.startOrQueue(ROOT, teamId, fakeRequest('s1'))
+    queue.startOrQueue(ROOT, teamId, fakeRequest('s2'))
+
+    const s1Id = SessionId('sid-expired-s1')
+    resolvers[0]!({ member: { ...fakeView('s1'), id: s1Id } })
+    await (first as { status: 'active'; promise: Promise<SpawnTeammateResult> }).promise
+
+    queue.onSpecialistSettled(s1Id)
+
+    expect(canPromote).toHaveBeenCalled()
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(queue.activeCount(teamId)).toBe(0)
+    expect(queue.pendingCount(teamId)).toBe(0)
+    expect(onCancelled).toHaveBeenCalledWith(ROOT, teamId, 's2')
+  })
+
   describe('lifecycle callbacks', () => {
     it('fires onQueued when a specialist is pushed to queue', () => {
       const spawnFn = vi.fn().mockReturnValue(new Promise(() => undefined))

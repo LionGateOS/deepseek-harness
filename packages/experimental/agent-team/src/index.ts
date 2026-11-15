@@ -95,6 +95,7 @@ export class TeamService extends Service {
     maxTasks: z.number().step(1).min(1).default(DEFAULT_MAX_TASKS),
     maxMessageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_MESSAGE_BYTES),
     disposalTimeoutMs: z.number().step(1).min(1).default(DEFAULT_DISPOSAL_TIMEOUT_MS),
+    maxTeamRuntimeMs: z.number().step(1).min(1),
     specialists: z.array(z.object({
       name: z.string().required(),
       description: z.string().required(),
@@ -109,7 +110,7 @@ export class TeamService extends Service {
   })
 
   /** Validated deployment limits used by every Team operation. */
-  private readonly config: Required<Config>
+  private readonly config: Required<Omit<Config, 'maxTeamRuntimeMs'>> & Pick<Config, 'maxTeamRuntimeMs'>
 
   private readonly activity: TeamActivity
   private readonly lifecycle: TeamRuntimeLifecycle
@@ -128,6 +129,9 @@ export class TeamService extends Service {
         'disposalTimeoutMs',
         config.disposalTimeoutMs ?? DEFAULT_DISPOSAL_TIMEOUT_MS,
       ),
+      ...(config.maxTeamRuntimeMs === undefined
+        ? {}
+        : { maxTeamRuntimeMs: positiveLimit('maxTeamRuntimeMs', config.maxTeamRuntimeMs) }),
       specialists: Array.from(config.specialists ?? []),
       maxActiveSpecialists: positiveLimit(
         'maxActiveSpecialists',
@@ -139,12 +143,19 @@ export class TeamService extends Service {
     this.activity = new TeamActivity()
     this.lifecycle = new TeamRuntimeLifecycle(this.config.disposalTimeoutMs)
     this.journal = new TeamJournal(ctx, (root) => { this.activity.notify(TeamId(root.id)) })
-    this.roster = new TeamRoster(ctx, this.journal, this.lifecycle, this.config.maxMembers)
+    this.roster = new TeamRoster(
+      ctx,
+      this.journal,
+      this.lifecycle,
+      this.config.maxMembers,
+      (root) => { this.assertTeamTimeAvailable(root) },
+    )
     this.specialistQueue = new SpecialistQueue(
       this.config.maxActiveSpecialists,
       (root, req) => this.roster.spawn(root, req),
       this.config.routeLimits,
       {
+        canPromote: (root) => !this.teamTimeExpired(root),
         onQueued: (root, teamId, name, provider, position) => {
           // The Lead session may close before this event flushes during specialist disposal at teardown.
           void this.journal.appendAndFlush(root, 'team/specialist/queued', {
@@ -177,6 +188,13 @@ export class TeamService extends Service {
     ctx.on('agent/status', ({ agent }) => {
       const membership = this.roster.tryMembership(agent)
       if (membership !== undefined) this.activity.notify(membership.id)
+    })
+    ctx.on('agent/pre-step', async ({ agent }, next) => {
+      const membership = this.roster.tryMembership(agent)
+      if (membership?.role === 'teammate' && this.teamTimeExpired(membership.root)) {
+        return { kind: 'reject' }
+      }
+      return await next()
     })
     ctx.on('agent/disposed', ({ agent }) => { this.specialistQueue.onSpecialistSettled(agent.id) })
     ctx.effect(() => {
@@ -357,6 +375,7 @@ export class TeamService extends Service {
       ...(req.agentOptions !== undefined ? { agentOptions: req.agentOptions } : {}),
       signal,
     }
+    this.assertTeamTimeAvailable(membership.root)
     const outcome = this.specialistQueue.startOrQueue(membership.root, membership.id, spawnRequest)
     if (outcome.status === 'active') {
       const result = await outcome.promise
@@ -379,6 +398,7 @@ export class TeamService extends Service {
     if (Buffer.byteLength(JSON.stringify(content), 'utf8') > this.config.maxMessageBytes) {
       throw new TeamError(`team message exceeds ${this.config.maxMessageBytes} bytes`, 'TEAM_MESSAGE_TOO_LARGE')
     }
+    if (target.id !== root.id) this.assertTeamTimeAvailable(root)
     const source = { kind: 'agent-message' as const, form: 'relay' as const, senderSessionId: caller.id }
     let messageId
     if (target.id === root.id) {
@@ -390,6 +410,29 @@ export class TeamService extends Service {
     }
     this.activity.notify(membership.id)
     return { messageId }
+  }
+
+  /** Return the projected durable clock origin for one Team, if delegated work has begun. */
+  private teamStartTime(root: Agent): number | undefined {
+    return this.journal.state(root).teamStartedAt
+  }
+
+  /** Whether the optional Team wall-clock budget has been exhausted. */
+  private teamTimeExpired(root: Agent, now = Date.now()): boolean {
+    const limit = this.config.maxTeamRuntimeMs
+    if (limit === undefined) return false
+    const startedAt = this.teamStartTime(root)
+    if (startedAt === undefined) return false
+    return Math.max(0, now - startedAt) >= limit
+  }
+
+  /** Reject new delegated work after the optional Team wall-clock budget expires. */
+  private assertTeamTimeAvailable(root: Agent): void {
+    if (!this.teamTimeExpired(root)) return
+    throw new TeamError(
+      `Team runtime limit ${this.config.maxTeamRuntimeMs}ms reached`,
+      'TEAM_TIME_LIMIT',
+    )
   }
 
   /** Queue one contained provisioning reconciliation after publication has unwound. */

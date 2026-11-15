@@ -130,6 +130,8 @@ const teamMessageDeliveredEventSchema = z.object({
  */
 export interface TeamState {
   readonly id: TeamId
+  /** Unix epoch milliseconds of the first durable delegated member edge. */
+  readonly teamStartedAt?: number
   readonly members: readonly TeamMemberSnapshot[]
   readonly tasks: readonly TeamTaskSnapshot[]
   readonly messages: readonly TeamMessageSnapshot[]
@@ -166,6 +168,7 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
 
 const teamProjectionEntrySchema = z.object({
   id: teamIdSchema,
+  teamStartedAt: nonNegativeSafeInteger.optional(),
   members: z.array(teamMemberSnapshotSchema),
   tasks: z.array(teamTaskSnapshotSchema),
   messages: z.array(teamMessageSnapshotSchema),
@@ -265,7 +268,11 @@ function applyCurrentTeamEvent(state: TeamProjectionState, event: TeamSessionEve
           throw new Error(`teammate "${member.name}" has an invalid ${prior.phase} -> ${member.phase} transition`)
         }
       }
-      return { ...state, members: replaceAt(state.members, index, member) }
+      return {
+        ...state,
+        ...(state.teamStartedAt === undefined ? { teamStartedAt: event.time } : {}),
+        members: replaceAt(state.members, index, member),
+      }
     }
     case 'team/task': {
       const task = event.data.task
@@ -386,7 +393,7 @@ export function teamProjectionView(state: TeamProjectionState): TeamProjection {
 /** Team projection selected by the projected Session identity; the wire view carries durable roster and task state only. */
 export const teamProjectionDefinition = {
   key: 'agentTeam',
-  stateVersion: 4,
+  stateVersion: 5,
   stateSchema: teamProjectionEntrySchema,
   init: header => emptyTeamState(header.id),
   apply: applyProjectionEvent,

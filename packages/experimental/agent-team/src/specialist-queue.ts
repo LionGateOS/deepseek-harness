@@ -26,6 +26,8 @@ interface TeamSlots {
  * asynchronous work (e.g., fire-and-forget session event writes).
  */
 export interface SpecialistQueueCallbacks {
+  /** Return false when queued work must no longer be promoted. */
+  canPromote?: (root: Agent, teamId: TeamId) => boolean
   /** Called when a specialist enters the queue; position is 0-indexed depth ahead of this entry. */
   onQueued?: (root: Agent, teamId: TeamId, name: string, provider: string, position: number) => void
   /** Called when a queued specialist claims a slot and starts provisioning. */
@@ -180,6 +182,12 @@ export class SpecialistQueue {
       const entry = slots.pending[i]!
       if (entry.cancelled) {
         slots.pending.splice(i, 1)
+        continue
+      }
+      if (this.callbacks.canPromote?.(entry.root, teamId) === false) {
+        slots.pending.splice(i, 1)
+        entry.cancelled = true
+        this.callbacks.onCancelled?.(entry.root, teamId, entry.request.name)
         continue
       }
       const routeLimit = this.routeLimits.get(entry.request.provider)

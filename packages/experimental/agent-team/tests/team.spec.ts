@@ -162,11 +162,130 @@ describe('Team identity and provisioning', () => {
       'maxTasks',
       'maxMessageBytes',
       'disposalTimeoutMs',
+      'maxTeamRuntimeMs',
     ] as const
     for (const field of fields) {
       for (const value of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
         await expect(setup([], { [field]: value })).rejects.toThrow()
       }
+    }
+  })
+
+  it('starts the optional Team runtime leash at first delegated work and blocks new child admission after expiry', async () => {
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(1_000)
+
+    const { ctx, lead } = await setup([
+      textResponse('first worker answer'),
+      textResponse('second worker answer'),
+    ], {
+      maxTeamRuntimeMs: 1_000,
+      maxMessageBytes: 192,
+      specialists: [{
+        name: 'reviewer',
+        description: 'review specialist',
+        prompt: 'Review the assigned work.',
+      }],
+    })
+
+    // A long-lived Lead Session does not consume the Team leash before delegation begins.
+    clock.mockReturnValue(100_000)
+    const first = await spawn(ctx, lead, 'first-worker')
+    expect(first.member.name).toBe('first-worker')
+
+    expect(ctx.sessionProjections.stateOf(lead.session, 'agentTeam')?.teamStartedAt).toBe(100_000)
+
+    clock.mockReturnValue(100_500)
+    const second = await spawn(ctx, lead, 'second-worker')
+    expect(second.member.name).toBe('second-worker')
+    expect(ctx.sessionProjections.stateOf(lead.session, 'agentTeam')?.teamStartedAt).toBe(100_000)
+
+    let replayed = teamProjectionDefinition.init(lead.session.header)
+    for (const event of lead.session.snapshotEvents()) replayed = teamProjectionDefinition.apply(replayed, event)
+    expect(replayed.teamStartedAt).toBe(100_000)
+
+    clock.mockReturnValue(101_000)
+
+    await expect(spawn(ctx, lead, 'late-worker'))
+      .rejects.toMatchObject({ code: 'TEAM_TIME_LIMIT' })
+
+    // Existing roster validation still wins when it would have rejected first.
+    await expect(spawn(ctx, lead, 'first-worker'))
+      .rejects.toMatchObject({ code: 'TEAM_MEMBER_NAME_TAKEN' })
+
+    await expect(ctx.agentTeams.startSpecialist(lead, {
+      name: 'reviewer',
+      provider: 'spawn',
+      signal: SIGNAL,
+    })).rejects.toMatchObject({ code: 'TEAM_TIME_LIMIT' })
+
+    await expect(ctx.agentTeams.sendMessage(lead, {
+      target: 'first-worker',
+      content: content('late wake'),
+      signal: SIGNAL,
+    })).rejects.toMatchObject({ code: 'TEAM_TIME_LIMIT' })
+
+    // Existing request-validation errors retain precedence over the time leash.
+    await expect(ctx.agentTeams.startSpecialist(lead, {
+      name: 'missing',
+      provider: 'spawn',
+      signal: SIGNAL,
+    })).rejects.toMatchObject({ code: 'SPECIALIST_NOT_FOUND' })
+
+    await expect(ctx.agentTeams.sendMessage(lead, {
+      target: 'first-worker',
+      content: content('x'.repeat(256)),
+      signal: SIGNAL,
+    })).rejects.toMatchObject({ code: 'TEAM_MESSAGE_TOO_LARGE' })
+  })
+
+  it('lets an expired teammate report to the Lead but rejects its next model step', async () => {
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(1_000)
+
+    const { ctx, lead, adapter } = await setup([
+      textResponse('worker completed'),
+      textResponse('lead received final report'),
+      textResponse('expired teammate must not request this response'),
+    ], {
+      maxTeamRuntimeMs: 1_000,
+    })
+
+    clock.mockReturnValue(100_000)
+    const worker = await spawn(ctx, lead, 'reporter')
+    await waitNoAgent(ctx, worker.member.id)
+    const baselineRequests = adapter.requests.length
+    expect(baselineRequests).toBeGreaterThan(0)
+
+    clock.mockReturnValue(101_000)
+
+    const resumed = await ctx.agents.resume({
+      resumeSessionId: worker.member.id,
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+
+    try {
+      const report = await ctx.agentTeams.sendMessage(resumed.agent, {
+        target: 'lead',
+        content: content('final report after expiry'),
+        signal: SIGNAL,
+      })
+      expect(report.messageId).toBeTypeOf('string')
+
+      // The Team Lead remains human-facing and is not blocked by the teammate leash.
+      await lead.whenIdle()
+      expect(adapter.requests).toHaveLength(baselineRequests + 1)
+
+      // A teammate may not enter another model step after Team time expires.
+      resumed.agent.followup(createUserMessage({
+        content: content('attempt another teammate step'),
+        source: { kind: 'user' },
+      }))
+      await resumed.agent.whenIdle()
+
+      expect(adapter.requests).toHaveLength(baselineRequests + 1)
+    } finally {
+      await resumed.dispose()
     }
   })
 
