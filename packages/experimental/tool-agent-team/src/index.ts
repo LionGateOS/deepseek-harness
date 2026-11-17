@@ -6,7 +6,7 @@ import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import { TeamTaskId } from '@deepseek-ai/dsh-experimental-agent-team'
-import type { TeamMemberView, StartSpecialistResult } from '@deepseek-ai/dsh-experimental-agent-team'
+import type { TeamMemberView, StartSpecialistResult, SpecialistDefinition } from '@deepseek-ai/dsh-experimental-agent-team'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { InferValue, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import {
@@ -769,13 +769,19 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
           const turnKey = specialistContinuationTurnKey(teamSession)
           const continuation = specialistContinuationStateOf(ctx.sessionProjections, teamSession, turnKey)
           assertAutomaticSpecialistStart(mode, continuation)
+          const def = ctx.agentTeams.specialists.find((s: SpecialistDefinition) => s.name === args.name)
+          const effectiveModel = args.model ?? def?.model
+          const effectiveProvider = args.provider ?? def?.provider
+          const resolvedProvider = effectiveModel !== undefined && effectiveProvider === undefined
+            ? config.freshProvider
+            : effectiveProvider
           const agentOptions = await resolveTeammateAgentOptions(
             ctx,
             agent,
             teamSelectionPolicy,
             'fresh',
-            args.provider,
-            args.model,
+            resolvedProvider,
+            effectiveModel,
             args.reasoning_effort,
             exec.signal,
           )

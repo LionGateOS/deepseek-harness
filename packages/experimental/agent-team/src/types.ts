@@ -221,6 +221,11 @@ export interface SpecialistDefinition {
   readonly prompt: string
   /** Provider route override; inherits freshProvider from tool config when omitted. */
   readonly provider?: string
+  /**
+   * Model id override for this specialist. Uses the session/default model when omitted.
+   * Precedence: explicit spawn-time model > specialist catalog model > session default.
+   */
+  readonly model?: string
 }
 
 /**
