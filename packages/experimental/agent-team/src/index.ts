@@ -5,7 +5,7 @@ import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
+import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm/types'
 import { steerHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import { TeamActivity } from './activity.ts'
 import { errorMessage, TeamError } from './error.ts'
@@ -189,9 +189,10 @@ export class TeamService extends Service {
       const membership = this.roster.tryMembership(agent)
       if (membership !== undefined) this.activity.notify(membership.id)
     })
-    ctx.on('agent/pre-step', async ({ agent }, next) => {
+    ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
       const membership = this.roster.tryMembership(agent)
       if (membership?.role === 'teammate' && this.teamTimeExpired(membership.root)) {
+        this.relayExpiredClaimToLead(agent, membership, messages)
         return { kind: 'reject' }
       }
       return await next()
@@ -433,6 +434,45 @@ export class TeamService extends Service {
       `Team runtime limit ${this.config.maxTeamRuntimeMs}ms reached`,
       'TEAM_TIME_LIMIT',
     )
+  }
+
+  /**
+   * Steer one expired teammate's claimed-but-unprocessed messages to the exempt
+   * Lead so leash rejection cannot silently lose admitted delegated work.
+   * Delivery is best effort: the rejection itself never depends on it, and a
+   * failed relay is logged rather than thrown. A notice message states the
+   * `TEAM_TIME_LIMIT` cause and names the teammate; the claimed messages then
+   * follow verbatim — content and original source attribution untouched — so
+   * the sender identity survives the relay.
+   * @param sender - the expired teammate Agent proposing the rejected step.
+   * @param membership - the same teammate's Team membership.
+   * @param messages - the messages the loop claimed for the rejected step.
+   */
+  private relayExpiredClaimToLead(
+    sender: Agent,
+    membership: TeamMembership,
+    messages: readonly UserMessage[],
+  ): void {
+    if (messages.length === 0) return
+    const notice = createUserMessage({
+      content: [
+        {
+          type: 'text' as const,
+          text: `Team message relayed from ${membership.name} because the Team runtime limit ` +
+            `${this.config.maxTeamRuntimeMs}ms was reached (TEAM_TIME_LIMIT) before the step could run; ` +
+            `the ${messages.length} claimed original message${messages.length === 1 ? '' : 's'} follow unmodified:`,
+        },
+      ],
+      source: { kind: 'agent-message' as const, form: 'relay' as const, senderSessionId: sender.id },
+    })
+    try {
+      membership.root.steer(notice)
+      for (const message of messages) membership.root.steer(message)
+    } catch (error: unknown) {
+      this.ctx.logger.warn(
+        `Agent Teams relay of "${membership.name}" messages to the Lead failed: ${errorMessage(error)}`,
+      )
+    }
   }
 
   /** Queue one contained provisioning reconciliation after publication has unwound. */

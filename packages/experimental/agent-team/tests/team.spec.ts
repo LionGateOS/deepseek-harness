@@ -289,6 +289,101 @@ describe('Team identity and provisioning', () => {
     }
   })
 
+  it('relays a claimed teammate message to the Lead when the leash rejects the step after the claim', async () => {
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(1_000)
+
+    const { ctx, lead, adapter } = await setup([
+      textResponse('worker runs'),
+      textResponse('lead answers the relayed message'),
+      textResponse('must stay unanswered, the teammate leash rejected this turn'),
+    ], {
+      maxTeamRuntimeMs: 1_000,
+    })
+
+    clock.mockReturnValue(100_000)
+    const worker = await spawn(ctx, lead, 'claimer')
+    await waitNoAgent(ctx, worker.member.id)
+    const baselineRequests = adapter.requests.length
+
+    clock.mockReturnValue(1_200_000)
+    const resumed = await ctx.agents.resume({
+      resumeSessionId: worker.member.id,
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    try {
+      // Followup input is claimed by the next turn before the leash rejects it:
+      // exactly the claim-then-reject boundary where delegated work used to be
+      // lost. The sender-facing attribution mirrors the Team relay source.
+      const sent = createUserMessage({
+        content: content('work that must not be lost to the leash'),
+        source: { kind: 'agent-message' as const, form: 'relay' as const, senderSessionId: lead.id },
+      })
+      resumed.agent.followup(sent)
+      await resumed.agent.whenIdle()
+      await lead.whenIdle()
+      await ctx.sessions.flush(lead.session)
+      const leadEvents = await storedEvents(ctx, lead.id)
+      const relayed = leadEvents
+        .flatMap(event => event.type === 'user/message' ? [event.data] : [])
+        .filter(message => message.source.kind === 'agent-message')
+      expect(relayed.length).toBeGreaterThan(0)
+      const relayedText = relayed.map(message =>
+        message.content
+          .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+          .map(block => block.text).join('\n'))
+      expect(relayedText.some(text => text.includes('TEAM_TIME_LIMIT'))).toBe(true)
+      // The claimed message content reached the Lead verbatim, with its original
+      // source attribution intact.
+      expect(relayedText.some(text => text.includes('work that must not be lost to the leash'))).toBe(true)
+      const original = relayed.find(message =>
+        message.content.some(block => block.type === 'text' && block.text.includes('work that must not be lost')))
+      expect(original?.source).toMatchObject({ kind: 'agent-message', senderSessionId: lead.id })
+      // The rejected teammate turn consumed no fresh model request. The Lead
+      // handles the relay as two steered steps: the notice and the claimed
+      // message itself.
+      expect(adapter.requests).toHaveLength(baselineRequests + 2)
+    } finally {
+      await resumed.dispose()
+    }
+  })
+
+  it('relays no notice when an expired teammate is rejected with an empty claimed batch', async () => {
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(1_000)
+
+    const { ctx, lead, adapter } = await setup([
+      textResponse('worker runs'),
+      textResponse('unrelated later lead work'),
+    ], {
+      maxTeamRuntimeMs: 1_000,
+    })
+
+    clock.mockReturnValue(100_000)
+    const worker = await spawn(ctx, lead, 'quiet')
+    await waitNoAgent(ctx, worker.member.id)
+    const baselineRequests = adapter.requests.length
+
+    clock.mockReturnValue(1_200_000)
+    const resumed = await ctx.agents.resume({
+      resumeSessionId: worker.member.id,
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    try {
+      await resumed.agent.whenIdle()
+      await lead.whenIdle()
+      // No messages were claimed, so no relay notice may appear on the Lead.
+      const leadEvents = await storedEvents(ctx, lead.id)
+      const relayed = leadEvents
+        .flatMap(event => event.type === 'user/message' ? [event.data.source.kind] : [])
+        .filter(kind => kind === 'agent-message')
+      expect(relayed).toHaveLength(0)
+      expect(adapter.requests).toHaveLength(baselineRequests)
+    } finally {
+      await resumed.dispose()
+    }
+  })
+
   it('supports direct-constructor defaults and recovers roots that already exist', async () => {
     const ctx = new Context()
     contexts.push(ctx)
