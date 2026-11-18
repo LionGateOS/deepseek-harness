@@ -1,6 +1,5 @@
 import type { LlmFailure } from '@deepseek-ai/dsh-llm/types'
 import type { RetryId } from './brand.ts'
-import type { PlacementTarget } from '@deepseek-ai/dsh-agent-default-model'
 
 export type { RetryId }
 
@@ -26,19 +25,12 @@ export interface LlmFallbackPolicySource {
    * @returns the eligible fallback candidate identity (provider + model), or
    *   `null` when none qualifies or the candidate lacks an explicit model.
    */
-  findFallbackProvider(): Pick<PlacementTarget, 'provider' | 'model'> | null
+  findFallbackProvider(): { provider: string; model: string } | null
   /**
    * Read the current default selection for model ids.
    * @returns the current provider/model selection.
    */
   currentSelection(): { provider: string; model: string }
-}
-
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    /** Optional owner of fallback policy data; absent when the host does not provide default-model selection. */
-    agentDefaultModel?: LlmFallbackPolicySource
-  }
 }
 
 /** Durable payload recorded when one failed request transitions to its fallback route. */

@@ -96,7 +96,7 @@ export class AgentDefaultModelConfig extends Service {
    * keeping inter-provider fallback disabled until profile activation.
    * @returns the eligible fallback candidate identity, or `null`.
    */
-  findFallbackProvider(): Pick<PlacementTarget, 'provider' | 'model'> | null {
+  findFallbackProvider(): { provider: string; model: string } | null {
     const targets = this.config.placement.get()
     if (targets === undefined || targets.length === 0) return null
     const fallback = targets.find(target => target.automaticFallback === true)
