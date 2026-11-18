@@ -297,7 +297,31 @@ export interface ToolDefinition extends ToolSchema {
    * for the same replay reason.
    */
   presentResult?(args: unknown, result: ToolResult): ToolResultView | undefined
-}
+  /**
+   * Opt-in contract for result reuse (duplicate in-flight suppression +
+   * settled-value memoization). Called with validated (frozen) arguments
+   * right before dispatch. Returns undefined (no reuse) or a config with
+   * scope, a non-empty string key, and an optional TTL in ms.
+   *
+   * - ttlMs omitted or 0: duplicate in-flight suppression only; no settled memo.
+   * - ttlMs > 0: in-flight suppression plus memo of the successful canonical
+   *   value until the entry expires.
+   * - scope 'agent': reuse is partitioned by current Agent identity.
+   * - scope 'runtime': process-local sharing across all Agents.
+   *
+   * This is never model-visible; `schemas()` excludes it.
+   * @param validatedArgs - frozen parsed arguments passed to the tool body.
+   * @returns reuse config or undefined.
+   */
+  resultReuse?(validatedArgs: unknown): ResultReuseConfig | undefined
+   /**
+    * Stable process-local identity assigned by {@link defineTool}; used for
+    * result-reuse cache keying so a replaced/reloaded definition object never
+    * inherits stale entries. Absent on hand-built definitions (the registry
+    * falls back to object-identity WeakMap assignment).
+    */
+   resultReuseId?: number
+ }
 
 /** The completed outcome handed to {@link ToolDefinition.presentResult}. */
 export interface ToolResult {
@@ -692,6 +716,12 @@ export interface Config {
    * restores strictly serial dispatch. Must be a positive integer.
    */
   maxParallelSubCalls?: number
+  /**
+   * Maximum number of settled result-reuse entries retained in the
+   * process-local cache (default 64). A bounded FIFO capacity keeps
+   * memory usage stable regardless of how many distinct keys accumulate.
+   */
+  resultReuseCapacity?: number
 }
 
 /**
@@ -786,6 +816,42 @@ interface ToolCancellationState {
   bodyInvoked: boolean
 }
 
+/** Result-reuse cache entry for a settled canonical value. */
+interface ResultReuseEntry {
+  value: JsonValue
+  expiry: number
+}
+
+/** One in-flight execution: the leader's identity and its outcome promise. */
+interface ResultReuseInFlight {
+   /** The leader's execution token. */
+   readonly leaderToken: ToolExecutionToken
+   /** The leader's outcome promise: resolved when the leader settles. */
+   readonly outcome: Promise<{ kind: 'success'; value: JsonValue } | { kind: 'failed' }>
+   /** Resolve the outcome promise. */
+   resolve(value: { kind: 'success'; value: JsonValue } | { kind: 'failed' }): void
+   /** The scope key (precomputed for convenience). */
+   readonly scopeKey: string
+}
+
+/** resultReuse classifier return value. */
+export interface ResultReuseConfig {
+  /** 'agent' partitions by current Agent; 'runtime' shares across Agents. */
+  readonly scope: 'agent' | 'runtime'
+  /** Non-empty string identifying this reuse key. */
+  readonly key: string
+  /** TTL in milliseconds. 0 = in-flight only (no settled memo). */
+  readonly ttlMs?: number
+}
+
+/** Monotonically assigned identity for Agent objects when scope='agent'. */
+let _agentIdentityCounter = 0;
+const _agentIdentityMap = new WeakMap<object, number>();
+
+/** Monotonically assigned identity for ToolDefinition objects (used in cache keys). */
+let _defIdentityCounter = 0;
+const _defIdentityMap = new WeakMap<object, number>();
+
 /** One dispatch-scoped fused signal plus listener cleanup after the body settles. */
 interface FusedToolSignal {
   readonly signal: AbortSignal
@@ -811,6 +877,7 @@ export class ToolRuntime extends Service {
   static Config: z<Config> = z.object({
     mode: z.union(['native', 'ptc'] as const).default('native'),
     maxParallelSubCalls: z.natural().min(1).default(10),
+    resultReuseCapacity: z.natural().min(1).default(64),
   })
 
   /** Internal staged view consumed by `dsh-agent-loop`'s parallel scheduler. */
@@ -838,6 +905,12 @@ export class ToolRuntime extends Service {
   /** Presentation for scopes that declare none; {@link presentAs} shadows it per scope. */
   private readonly defaultMode: ToolPresentationMode
   private readonly maxParallelSubCalls: number
+  /** Maximum settled result-reuse entries retained (bounded FIFO). */
+  private readonly resultReuseCapacity: number
+  /** Settled result-reuse cache entries, keyed by `scopeKey::key`. */
+  private readonly _settledResults = new Map<string, ResultReuseEntry>()
+  /** In-flight execution promises keyed by `scopeKey::key`. */
+  private readonly _inFlight = new Map<string, ResultReuseInFlight>()
   /**
    * Reserved presentation transport, kept outside the filterable registration
    * layers. Built on first need rather than at construction: which agents run
@@ -854,6 +927,7 @@ export class ToolRuntime extends Service {
     // optional-input type for direct (non-Loader) construction in tests.
     this.defaultMode = config.mode ?? 'native'
     this.maxParallelSubCalls = resolveMaxParallelSubCalls(config.maxParallelSubCalls)
+    this.resultReuseCapacity = config.resultReuseCapacity ?? 64
     ctx.systemPrompt.tools(context => this.wireSchemas(context.scope))
     if (this.defaultMode !== 'native') {
       ctx.systemPrompt.section(this.collapseSection())
@@ -1564,55 +1638,13 @@ export class ToolRuntime extends Service {
       : toolAbortedBeforeDispatchResult(prior)
   }
 
-  /**
-   * Dispatch the registered body with the original caller signal fused back
-   * into any around-wrapper replacement. Cancellation never abandons the body:
-   * a started promise reaches quiescence before its outcome becomes `ABORTED`.
-   */
-  private async dispatchToolBody(exec: MutableToolRunContext): Promise<ToolExecutionResult> {
-    const state = this.cancellationStates.get(exec)
-    /* v8 ignore next -- only registry-minted executions reach the staged scheduler methods */
-    if (state === undefined) throw new Error('tool registry scheduler invariant violated: missing cancellation state')
-    const wrapperSignal = exec.signal
-    const fused = fuseToolSignals(state.callerSignal, wrapperSignal)
-    const signal = fused.signal
-
-    if (isAborted(signal)) {
-      fused.dispose()
-      return toolAbortedBeforeDispatchResult()
-    }
-    exec.signal = signal
-    try {
-      const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
-      if (!tool) throw new ToolNotFoundError(exec.name)
-      state.bodyInvoked = true
-      const returned = await tool.execute(exec.arguments, exec)
-      const result = this.createSuccessResult(exec, tool, returned)
-      return isAborted(signal)
-        ? toolAbortedResult(result)
-        : result
-    } catch (error: unknown) {
-      return toolErrorResult(error)
-    } finally {
-      fused.dispose()
-      exec.signal = wrapperSignal
-    }
-  }
-
-  /**
-   * Run around-dispatch and the tool body. Tool and unknown-tool failures still
-   * receive post-execute; pipeline failures are already final.
-   * @param exec - the prepared execution.
-   * @returns whether the result still needs post-execute.
-   * @internal
-   */
   private async dispatchScheduledExecution(exec: ToolRunContext): Promise<ScheduledToolDispatch> {
     try {
       const mutableExec = exec as MutableToolRunContext
       const carrier = scopeTarget(this, exec.agent)
       const result = await this.ctx.waterfall(
         carrier, 'tools/execute', mutableExec,
-        () => this.dispatchToolBody(mutableExec),
+        () => this._dispatchToolBodyWithReuse(mutableExec),
       )
       const normalized = this.normalizeDispatchResult(exec, result)
       const deferredContexts = this.deferredContexts.get(exec)
@@ -1636,6 +1668,256 @@ export class ToolRuntime extends Service {
     } catch (error: unknown) {
       return { kind: 'final-result', result: toolErrorResult(error) }
     }
+  }
+
+  /**
+   * Body-dispatch with reuse coordinator inside the tools/execute wrapper.
+   * Every call independently traverses pre-execute, guards, tools/execute,
+   * post-execute, and tools/result.
+   *
+   * Reuse semantics:
+   *   - resolves the current ToolDefinition's resultReuse config;
+   *   - checks settled cache (hit → reconstruct via current output contract);
+   *   - checks in-flight (follower → await leader outcome, or replace after failure);
+   *   - no leader → atomically become leader, execute body, publish canonical value;
+   *   - leader failure/abort → delete in-flight; surviving followers retry leadership.
+   *
+   * Only successful canonical JsonValue is memoized; never failures, denials,
+   * cancellations, errors, additionalContexts, rendered content, meta, concludesTurn.
+   *
+   * @param exec - the prepared (mutable) execution.
+   * @returns the body-dispatch result.
+   */
+  private async _dispatchToolBodyWithReuse(exec: MutableToolRunContext): Promise<ToolExecutionResult> {
+    const state = this.cancellationStates.get(exec)
+    /* v8 ignore next -- only registry-minted executions reach the staged scheduler methods */
+    if (state === undefined) throw new Error('tool registry scheduler invariant violated: missing cancellation state')
+    const wrapperSignal = exec.signal
+    const fused = fuseToolSignals(state.callerSignal, wrapperSignal)
+    const signal = fused.signal
+
+    if (isAborted(signal)) {
+      fused.dispose()
+      return toolAbortedBeforeDispatchResult()
+    }
+    exec.signal = signal
+    try {
+      const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+      if (!tool) throw new ToolNotFoundError(exec.name)
+
+      // Resolve resultReuse config for this tool.
+      const resultReuseFn = tool.resultReuse
+      if (resultReuseFn === undefined) {
+        // No opt-in: normal body dispatch.
+        try {
+          state.bodyInvoked = true
+          const returned = await tool.execute(exec.arguments, exec)
+          const result = this.createSuccessResult(exec, tool, returned)
+          return isAborted(signal) ? toolAbortedResult(result) : result
+        } catch (error: unknown) {
+          return toolErrorResult(error)
+        } finally {
+          fused.dispose()
+          exec.signal = wrapperSignal
+        }
+      }
+
+      // Validate the classifier output (finding 11: fail closed).
+      const config = resultReuseFn(exec.arguments)
+      if (config === undefined) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      if (typeof config !== 'object' || config === null) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      if (config.scope !== 'agent' && config.scope !== 'runtime') return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      if (typeof config.key !== 'string' || config.key === '') return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      if (config.ttlMs !== undefined && (!Number.isFinite(config.ttlMs) || config.ttlMs < 0)) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      // Agent-scoped reuse requires a real Agent identity: anonymous/direct
+      // registry calls fail closed to normal body dispatch.
+      if (config.scope === 'agent' && exec.agent === undefined) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+
+      // Find or create leader (finding 6: key includes ToolDefinition identity).
+      const cacheKey = this._makeCacheKey(exec, config)
+
+      // Check settled cache first (finding 10: reconstruction uses current output contract).
+      const settled = this._settledResults.get(cacheKey)
+      if (settled !== undefined) {
+        // Verify TTL expiry (finding 7: no expiry for in-flight, only settled).
+        if (config.ttlMs !== undefined && config.ttlMs > 0) {
+          if (Date.now() < settled.expiry) {
+            // Cache hit: reconstruct through the current ToolDefinition's output
+            // contract so this call owns its own rendering/presentation.
+            fused.dispose()
+            exec.signal = wrapperSignal
+            return this.createSuccessResult(exec, tool, settled.value)
+          }
+          // Expired — remove and continue to body dispatch.
+          this._settledResults.delete(cacheKey)
+        }
+      }
+
+      // Check in-flight. If hit, the follower awaits the leader's outcome.
+      const inFlight = this._inFlight.get(cacheKey)
+      if (inFlight !== undefined) {
+        return this._awaitLeader(exec, inFlight, cacheKey, tool, state, config, fused, wrapperSignal, signal)
+      }
+
+      // No in-flight: this call becomes the leader.
+      return await this._runReusableBody(exec, tool, cacheKey, config, state, fused, signal, wrapperSignal)
+    } catch (error: unknown) {
+      return toolErrorResult(error)
+    }
+  }
+
+  /**
+   * Await the leader's in-flight outcome as a follower. The follower waits on
+   * the leader's outcome promise using its own cancellation view: follower
+   * cancellation returns the follower's own aborted outcome without touching
+   * the leader (finding 8). If the leader failed, the follower retries as the
+   * replacement leader (finding 9): only one caller owns the replacement.
+   */
+  private async _awaitLeader(
+    exec: MutableToolRunContext,
+    inFlight: ResultReuseInFlight,
+    cacheKey: string,
+    tool: ToolDefinition,
+    state: ToolCancellationState,
+    config: ResultReuseConfig,
+    fused: FusedToolSignal,
+    wrapperSignal: AbortSignal,
+    signal: AbortSignal,
+  ): Promise<ToolExecutionResult> {
+    try {
+      const outcome = await inFlight.outcome
+      if (outcome.kind === 'success') {
+        // Reconstruct a call-own success through the current output contract.
+        return this.createSuccessResult(exec, tool, outcome.value)
+      }
+      // Leader failed: drop the stale entry (only if we still own the slot)
+      // and retry as the replacement leader.
+      if (this._inFlight.get(cacheKey) === inFlight) {
+        this._inFlight.delete(cacheKey)
+      }
+      const existing = this._inFlight.get(cacheKey)
+      if (existing !== undefined) {
+        // Another caller already claimed replacement leadership: follow it.
+        return await this._awaitLeader(exec, existing, cacheKey, tool, state, config, fused, wrapperSignal, signal)
+      }
+      return await this._runReusableBody(exec, tool, cacheKey, config, state, fused, signal, wrapperSignal)
+    } catch (err: unknown) {
+      // Follower-side wait failure (signal fusion error or reconstruction
+      // error): report as an error outcome without affecting the leader.
+      return toolErrorResult(err)
+    } finally {
+      fused.dispose()
+      exec.signal = wrapperSignal
+    }
+  }
+
+  /**
+   * Leader body execution shared by the first-dispatch leader and the
+   * replacement leader: run the tool body, publish the canonical value to the
+   * in-flight record, and store the settled memo when ttlMs > 0.
+   * Failures never become settled entries (never cache failures).
+   */
+  private async _runReusableBody(
+    exec: MutableToolRunContext,
+    tool: ToolDefinition,
+    cacheKey: string,
+    config: ResultReuseConfig,
+    state: ToolCancellationState,
+    fused: FusedToolSignal,
+    signal: AbortSignal,
+    wrapperSignal: AbortSignal,
+  ): Promise<ToolExecutionResult> {
+    const { promise, resolve } = this._makeDeferredPromise<{ kind: 'success'; value: JsonValue } | { kind: 'failed' }>()
+    const leaderEntry: ResultReuseInFlight = { leaderToken: exec.token, outcome: promise, resolve, scopeKey: cacheKey }
+    this._inFlight.set(cacheKey, leaderEntry)
+    state.bodyInvoked = true
+    try {
+      const returned = await tool.execute(exec.arguments, exec)
+      const bodyResult = this.createSuccessResult(exec, tool, returned)
+      if (isAborted(signal)) {
+        // Aborted after the body finished: do not publish a reusable value.
+        this._inFlight.delete(cacheKey)
+        leaderEntry.resolve({ kind: 'failed' })
+        return toolAbortedResult(bodyResult)
+      }
+      leaderEntry.resolve({ kind: 'success' as const, value: bodyResult.value })
+      // The leader settled: clear the in-flight record so a later call starts
+      // fresh (in-flight records live only until leader settlement).
+      if (this._inFlight.get(cacheKey) === leaderEntry) this._inFlight.delete(cacheKey)
+      if (config.ttlMs !== undefined && config.ttlMs > 0) {
+        const expiry = Date.now() + config.ttlMs
+        this._settledResults.set(cacheKey, { value: bodyResult.value, expiry })
+        // Bounded FIFO eviction.
+        if (this._settledResults.size > this.resultReuseCapacity) {
+          const oldestKey = this._settledResults.keys().next().value
+          if (oldestKey !== undefined) this._settledResults.delete(oldestKey)
+        }
+      }
+      return bodyResult
+    } catch (err: unknown) {
+      // Failure is never memoized; drop the in-flight entry so followers can retry.
+      this._inFlight.delete(cacheKey)
+      leaderEntry.resolve({ kind: 'failed' })
+      return toolErrorResult(err)
+    } finally {
+      fused.dispose()
+      exec.signal = wrapperSignal
+    }
+  }
+
+  /**
+   * Normal body dispatch — the no-opt-in and fail-closed-validation fallback
+   * path. Disposes the fused signal after the body settles.
+   */
+  private async _runBody(
+    exec: MutableToolRunContext,
+    tool: ToolDefinition,
+    state: ToolCancellationState,
+    fused: FusedToolSignal,
+    signal: AbortSignal,
+    wrapperSignal: AbortSignal,
+  ): Promise<ToolExecutionResult> {
+    try {
+      state.bodyInvoked = true
+      const returned = await tool.execute(exec.arguments, exec)
+      const result = this.createSuccessResult(exec, tool, returned)
+      return isAborted(signal) ? toolAbortedResult(result) : result
+    } finally {
+      fused.dispose()
+      exec.signal = wrapperSignal
+    }
+  }
+
+  /**
+   * Create a cache key scoped by ToolDefinition identity, Agent identity, and
+   * the classifier's key. Definitions without a `defineTool`-assigned
+   * `resultReuseId` fall back to object-identity WeakMap assignment so a
+   * replaced/reloaded definition never inherits stale results.
+   */
+  private _makeCacheKey(exec: ToolRunContext, config: ResultReuseConfig): string {
+    const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
+    let defId = 0
+    if (tool !== undefined) {
+      if (tool.resultReuseId !== undefined) {
+        defId = tool.resultReuseId
+      } else {
+        const existing = _defIdentityMap.get(tool)
+        defId = existing ?? (_defIdentityMap.set(tool, ++_defIdentityCounter), _defIdentityCounter)
+      }
+    }
+    // scope='agent' without an Agent identity already failed closed above, so
+    // agent scope always keys by a real Agent identity here.
+    const agentId = config.scope === 'agent'
+      ? (_agentIdentityMap.get(exec.agent!) ?? (_agentIdentityMap.set(exec.agent!, ++_agentIdentityCounter), _agentIdentityCounter))
+      : 0
+    return `${defId}::${agentId}::${config.key}`
+  }
+
+  /** Simple deferred promise factory. */
+  private _makeDeferredPromise<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>(r => { resolve = r })
+    return { promise, resolve }
   }
 
   /**

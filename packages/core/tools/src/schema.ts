@@ -3,7 +3,7 @@
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-import type { ToolDefinition, ToolExecution, ToolExecutionResult, ToolRunContext, ToolResult } from './index.ts'
+import type { ToolDefinition, ToolExecution, ToolExecutionResult, ToolRunContext, ToolResult, ResultReuseConfig } from './index.ts'
 import { assertSupportedJsonSchema, isJsonSchemaRecord, isPlainJsonArray, JsonSchemaError, validateJsonSchemaValue } from './json-schema.ts'
 import type { JsonSchemaNode, JsonSchemaScalar, ObjectJsonSchema } from './json-schema.ts'
 import type { ToolCallView, ToolResultView } from './presentation.ts'
@@ -507,6 +507,13 @@ export interface DefineToolOptions<S extends ParameterSchemaSpec, O extends Valu
    */
   isConcurrencySafe?(args: InferArgs<S>): boolean
   /**
+   * Host-only, model-invisible opt-in for result reuse (duplicate in-flight
+   * suppression plus optional settled-value memoization).
+   * @param args - typed validated arguments.
+   * @returns reuse config, or `undefined` for no reuse of any kind.
+   */
+  resultReuse?(args: InferArgs<S>): ResultReuseConfig | undefined
+  /**
    * Execute the tool after argument validation.
    * @param args - typed validated arguments.
    * @param exec - execution identity, caller, cancellation, and nesting data.
@@ -571,6 +578,7 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
   const userPresentResult = options.presentResult
   // oxlint-disable-next-line typescript/unbound-method
   const userIsConcurrencySafe = options.isConcurrencySafe
+  const userResultReuse = options.resultReuse
   if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) {
     throw new Error(`defineTool(${options.name}): timeoutMs must be a positive finite number`)
   }
@@ -628,5 +636,15 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
       return userIsConcurrencySafe(args as InferArgs<S>)
     }
   }
+  if (userResultReuse) {
+    tool.resultReuse = (validatedArgs: unknown): ResultReuseConfig | undefined =>
+      userResultReuse(validatedArgs as InferArgs<S>)
+    // Stable process-local identity for cache keying; a replaced/reloaded
+    // definition object gets a fresh id and never inherits stale results.
+    tool.resultReuseId = ++_resultReuseIdCounter
+  }
   return tool
 }
+
+/** Monotonic process-local identity counter assigned by {@link defineTool}. */
+let _resultReuseIdCounter = 0
