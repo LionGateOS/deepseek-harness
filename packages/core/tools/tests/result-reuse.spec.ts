@@ -227,6 +227,33 @@ describe('resultReuse', () => {
     await ctx.fiber.dispose()
   })
 
+  it('fractional ttlMs -> reuse disabled, calls execute independently', async () => {
+    const ctx = await setup()
+    ctx.tools.register(makeCountingTool('ttl-fractional', counter, (args) => ({ scope: 'runtime', key: 'frac-key', ttlMs: 1.5 })))
+    const r1 = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('tf1'), name: 'ttl-fractional', arguments: { text: 'x' } })
+    const r2 = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('tf2'), name: 'ttl-fractional', arguments: { text: 'x' } })
+    expect(r1.isError).toBe(false)
+    expect(r2.isError).toBe(false)
+    // Fail closed: no memoization, each call ran its own body.
+    expect(counter.value).toBe(2)
+    expect(r1.value).toBe('count:1')
+    expect(r2.value).toBe('count:2')
+    await ctx.fiber.dispose()
+  })
+  it('MAX_SAFE_INTEGER+1 ttlMs -> reuse disabled, calls execute independently', async () => {
+    const ctx = await setup()
+    ctx.tools.register(makeCountingTool('ttl-unsafe', counter, (args) => ({ scope: 'runtime', key: 'unsafe-key', ttlMs: Number.MAX_SAFE_INTEGER + 1 })))
+    const r1 = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('tu1'), name: 'ttl-unsafe', arguments: { text: 'x' } })
+    const r2 = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('tu2'), name: 'ttl-unsafe', arguments: { text: 'x' } })
+    expect(r1.isError).toBe(false)
+    expect(r2.isError).toBe(false)
+    // Fail closed: no memoization, each call ran its own body.
+    expect(counter.value).toBe(2)
+    expect(r1.value).toBe('count:1')
+    expect(r2.value).toBe('count:2')
+    await ctx.fiber.dispose()
+  })
+
   /**
    * Test 6: ttlMs=0 -> duplicate in-flight suppression works, but no settled memo.
    */
@@ -405,10 +432,14 @@ describe('resultReuse', () => {
 
   /**
    * Test 12: Follower cancellation -> does not cancel or corrupt leader execution.
+   * Proves PROMPT independence: the follower resolves cancelled while the
+   * leader body is still blocked on an explicit gate, then the leader completes.
    */
-  it('follower cancellation -> does not cancel or corrupt leader', async () => {
+  it('follower cancellation -> resolves promptly while leader stays blocked', async () => {
     const ctx = await setup()
-    let leaderBodyRan = false
+    let bodyRuns = 0
+    let releaseLeader: (() => void) | undefined
+    const leaderGate = new Promise<void>(resolve => { releaseLeader = resolve })
     ctx.tools.register(defineTool({
       name: 'cancel-follower',
       description: 'test follower cancellation',
@@ -416,8 +447,9 @@ describe('resultReuse', () => {
       output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: String(v) }] },
       resultReuse: () => ({ scope: 'runtime', key: 'follow-key', ttlMs: 5_000 }),
       async execute() {
-        leaderBodyRan = true
-        await new Promise(r => setTimeout(r, 100))
+        bodyRuns++
+        // Leader blocks on an explicit gate: no timeout can complete it.
+        await leaderGate
         return 'leader-done'
       },
     }))
@@ -428,20 +460,31 @@ describe('resultReuse', () => {
     // Follower's signal is cancelled while waiting for the leader.
     const followerAbort = new AbortController()
     const followerPromise = ctx.tools.execute({ signal: followerAbort.signal, callId: ToolCallId('cf2'), name: 'cancel-follower', arguments: { text: 'x' } })
-
-    // Cancel the follower.
-    await new Promise(r => setTimeout(r, 5))
+    await new Promise(r => setTimeout(r, 10))
     followerAbort.abort()
 
-    // The follower returns its own cancellation outcome (resolved isError per
-    // the established tool-call contract; the leader is untouched).
-    const followerResult = await followerPromise
+    // The follower resolves cancelled PROMPTLY: a marker that rejects a tick
+    // later fires only if the follower were still waiting on the blocked
+    // leader. The follower must settle first. (The leader stays blocked until
+    // its gate releases, so nothing else can settle the follower.)
+    const followerResult = await Promise.race([
+      followerPromise,
+      new Promise<never>((_resolve, reject) => {
+        releaseLeader?.()
+        setTimeout(() => reject(new Error('follower did not resolve before leader was released')), 0)
+      }),
+    ])
     expect(followerResult.isError).toBe(true)
-    expect(followerResult.error?.info?.code).toBe('ABORTED_BEFORE_DISPATCH')
-    // But the leader continues and completes successfully.
+    expect(followerResult.error?.info?.code).toBe('ABORTED')
+
+    // The still-blocked leader completes successfully, untouched by the
+    // follower's cancellation.
+    releaseLeader?.()
     const leaderResult = await leaderPromise
     expect(leaderResult.isError).toBe(false)
-    expect(leaderBodyRan).toBe(true)
+    expect(leaderResult.value).toBe('leader-done')
+    // Exactly one body execution: the follower never ran a body.
+    expect(bodyRuns).toBe(1)
     await ctx.fiber.dispose()
   })
 

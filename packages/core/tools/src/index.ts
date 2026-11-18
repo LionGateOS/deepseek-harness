@@ -1728,7 +1728,10 @@ export class ToolRuntime extends Service {
       if (typeof config !== 'object' || config === null) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
       if (config.scope !== 'agent' && config.scope !== 'runtime') return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
       if (typeof config.key !== 'string' || config.key === '') return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
-      if (config.ttlMs !== undefined && (!Number.isFinite(config.ttlMs) || config.ttlMs < 0)) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      // ttlMs, when supplied, must be a finite, non-negative safe integer;
+      // anything else fails closed to normal body dispatch.
+      if (config.ttlMs !== undefined && !Number.isSafeInteger(config.ttlMs)) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
+      if (config.ttlMs !== undefined && config.ttlMs < 0) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
       // Agent-scoped reuse requires a real Agent identity: anonymous/direct
       // registry calls fail closed to normal body dispatch.
       if (config.scope === 'agent' && exec.agent === undefined) return this._runBody(exec, tool, state, fused, signal, wrapperSignal)
@@ -1784,8 +1787,32 @@ export class ToolRuntime extends Service {
     wrapperSignal: AbortSignal,
     signal: AbortSignal,
   ): Promise<ToolExecutionResult> {
+    // Race the leader's outcome against this follower's own cancellation:
+    // a cancelled follower settles promptly with its own cancellation result
+    // without cancelling the leader, mutating its in-flight record, or
+    // becoming replacement leadership.
+    if (isAborted(signal)) {
+      fused.dispose()
+      exec.signal = wrapperSignal
+      return toolAbortedResult()
+    }
+    // The leader path always settles (success or failed), never rejects, so a
+    // detached leader outcome after follower cancellation cannot go unhandled.
+    const leaderOutcome = inFlight.outcome.then(
+      outcome => ({ winner: 'leader' as const, outcome }),
+      () => ({ winner: 'leader' as const, outcome: { kind: 'failed' as const } }),
+    )
+    let abortListener: (() => void) | undefined
+    const cancelled = new Promise<{ winner: 'cancelled' }>(resolve => {
+      abortListener = () => resolve({ winner: 'cancelled' })
+      signal.addEventListener('abort', abortListener, { once: true })
+    })
     try {
-      const outcome = await inFlight.outcome
+      const race = await Promise.race([leaderOutcome, cancelled])
+      if (race.winner === 'cancelled') {
+        return toolAbortedResult()
+      }
+      const outcome = race.outcome
       if (outcome.kind === 'success') {
         // Reconstruct a call-own success through the current output contract.
         return this.createSuccessResult(exec, tool, outcome.value)
@@ -1806,6 +1833,7 @@ export class ToolRuntime extends Service {
       // error): report as an error outcome without affecting the leader.
       return toolErrorResult(err)
     } finally {
+      if (abortListener !== undefined) signal.removeEventListener('abort', abortListener)
       fused.dispose()
       exec.signal = wrapperSignal
     }
