@@ -895,6 +895,7 @@ export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   ConsumeTokenRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   InsertTextRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   AgentHandle: 'agent ownership handle is owned by packages/core/agent/README.md',
+  PlacementTarget: 'placement target identity is owned by packages/core/agent-default-model/README.md',
   AgentPreset: 'discovered preset record is owned by packages/preset/agent-preset-registry/README.md',
   AgentPresetRoster: 'path-free preset roster is owned by packages/preset/agent-preset-registry/README.md',
   PresetDefinition: 'declarative configuration is owned by packages/preset/agent-preset/README.md',

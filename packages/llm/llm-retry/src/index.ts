@@ -10,13 +10,33 @@ import type { Context, Events } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
 import type { Agent, RequestErrorAction } from '@deepseek-ai/dsh-agent'
-import type { LlmFailure, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, type LlmCallConfig, type LlmFailure, type ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import { RetryId } from './brand.ts'
-import type { LlmRetryEventData } from './types.ts'
+import type { LlmFallbackEventData, LlmRetryEventData } from './types.ts'
 
-export type { LlmRetryEventData, LlmRetryStartedEventData } from './types.ts'
+/** Eligible normalized failure codes for automatic inter-provider fallback. */
+const INTER_PROVIDER_FALLBACK_CODES = new Set(['SERVER', 'TIMEOUT', 'TRANSPORT', EMPTY_RESPONSE_CODE])
+
+export type { LlmFallbackEventData, LlmRetryEventData, LlmRetryStartedEventData } from './types.ts'
 export { RetryId } from './brand.ts'
+
+/** One-shot override armed by the exhausted-retry fallback for a specific agent and turn. */
+interface ArmedFallback {
+  turn: number
+  provider: string
+  model: string
+}
+
+/** Per-agent fallback bookkeeping; keys are agent instances, never serialized. */
+interface FallbackMemory {
+  /** Inter-provider transitions already consumed this turn. */
+  transitions: number
+  /** Provider routes already attempted this turn; repeats are forbidden. */
+  attempted: Set<string>
+  /** Armed override to apply on the next `'agent/request'` within `turn`. */
+  armed: ArmedFallback | undefined
+}
 
 export const name = 'llm-retry'
 export const inject = ['agents', 'sessionProjections']
@@ -139,6 +159,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
   const random = internals.random ?? Math.random
   const lifetime = new AbortController()
   const active = new Set<Promise<RequestErrorAction>>()
+  const fallbackMemory = new WeakMap<Agent, FallbackMemory>()
 
   function track(operation: Promise<RequestErrorAction>): Promise<RequestErrorAction> {
     const tracked = operation.finally(() => active.delete(tracked))
@@ -220,7 +241,9 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     const retryState = ctx.sessionProjections.stateOf(agent.session, 'llmRetry') as LlmRetryState
     const previous = retryState[retryStateKey(provider, policyKey)]
     const previousRetry = previous?.retry ?? 0
-    if (policy.mode === 'normal' && previousRetry >= policy.maxRetries) return next()
+    if (policy.mode === 'normal' && previousRetry >= policy.maxRetries) {
+      return settleFallback(agent, turn, provider, failure, next)
+    }
     const retry = previousRetry + 1
     const retryId = previous?.retryId ?? RetryId(randomUUID())
     let delayMs: number
@@ -240,6 +263,50 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     return backoff(agent, turn, step, failure, provider, policy, policyKey, retry, retryId, delayMs, signal)
   }
 
+  /**
+   * Decide and arm one bounded inter-provider fallback after intra-provider
+   * retry exhaustion. Fail closed: at most one transition per turn, never a
+   * repeated route, and only into a route the fallback policy source still
+   * authorizes for automatic selection. The persistent default route is never
+   * mutated; the override lives only in this turn's `'agent/request'` pass.
+   */
+  async function settleFallback(
+    agent: Agent,
+    turn: number,
+    provider: string,
+    failure: LlmFailure,
+    next: () => Promise<RequestErrorAction>,
+  ): Promise<RequestErrorAction> {
+    const memory = fallbackMemory.get(agent) ?? { transitions: 0, attempted: new Set([provider]), armed: undefined }
+    fallbackMemory.delete(agent)
+    memory.attempted.add(provider)
+    fallbackMemory.set(agent, memory)
+    if (!INTER_PROVIDER_FALLBACK_CODES.has(failure.code)) return next()
+    if (memory.transitions >= 1) return next()
+    const defaultModel = ctx.get('agentDefaultModel')
+    if (defaultModel === undefined) return next()
+    const candidate = defaultModel.findFallbackProvider()
+    if (candidate === null || memory.attempted.has(candidate.provider)) return next()
+    memory.transitions += 1
+    memory.attempted.add(candidate.provider)
+    const candidateModel = candidate.model
+    const evidence: LlmFallbackEventData = {
+      failedProvider: provider,
+      failedModel: defaultModel.currentSelection().model,
+      failureCode: failure.code,
+      candidateProvider: candidate.provider,
+      candidateModel,
+      attempt: memory.transitions,
+      // The policy source yields one owner-approved candidate at a time, so
+      // nothing is excluded from consideration; the field records owner-approval
+      // or GPU-policy exclusions when a richer policy later supplies them.
+      excludedRoutes: [],
+    }
+    agent.session.append('llm/fallback', evidence)
+    memory.armed = { turn, provider: candidate.provider, model: candidateModel }
+    return { kind: 'retry' }
+  }
+
   const disposeListener = ctx.on('agent/request-error', (
     payload,
     next: () => Promise<RequestErrorAction>,
@@ -251,8 +318,23 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     return track(recover(payload, next))
   })
 
+  const disposeRequestListener = ctx.on('agent/request', async (
+    { agent, turn }: { agent: Agent; turn: number },
+    next: () => Promise<LlmCallConfig>,
+  ): Promise<LlmCallConfig> => {
+    // Call first so scoped model-selection listeners keep their authority; the
+    // armed fallback replaces only their provider/model outcome, once, this turn.
+    const config = await next()
+    const memory = fallbackMemory.get(agent)
+    if (memory?.armed?.turn !== turn) return config
+    const armed = memory.armed
+    memory.armed = undefined
+    return { ...config, provider: armed.provider, model: armed.model }
+  })
+
   ctx.effect(() => async () => {
     disposeListener()
+    disposeRequestListener()
     lifetime.abort(new Error('llm-retry plugin disposed'))
     await Promise.allSettled([...active])
   }, 'llm-retry: abort and drain active recovery')

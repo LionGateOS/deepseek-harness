@@ -1,6 +1,6 @@
 /** Default model references remain live without a settings service. */
 import { Context } from '@deepseek-ai/cordis'
-import { expect, it, onTestFinished, vi } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import DefaultModel from '../src/index.ts'
 import { liveConfig } from '../../../settings/settings/tests/live-config.ts'
 
@@ -66,4 +66,80 @@ it('serializes overlapping saves and continues after a rejected write', async ()
   await last
   expect(calls).toEqual(['rejected', 'saved'])
   expect(ctx.agentDefaultModel.currentSelection()).toEqual({ provider: 'test', model: 'final' })
+})
+
+describe('inter-provider fallback GPU policy', () => {
+  async function service(config: Record<string, unknown>) {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    await liveConfig(ctx, DefaultModel, { provider: 'p', model: 'm', ...config })
+    return ctx
+  }
+
+  it('returns no candidate without placement configuration (fallback disabled by default)', async () => {
+    const ctx = await service({})
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toBe(null)
+  })
+
+  it('selects the owner-approved RTX 3090 primary target when it has an explicit model', async () => {
+    const ctx = await service({
+      placement: [{ provider: 'qwen-local-3090', endpoint: 'http://127.0.0.1:8002', automaticFallback: true, model: 'glm-5.3-flash' }],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toEqual({ provider: 'qwen-local-3090', model: 'glm-5.3-flash' })
+  })
+
+  it('never auto-falls-back to RTX 3090 Ti targets', async () => {
+    const ctx = await service({
+      placement: [
+        { provider: 'qwen-local', endpoint: 'http://127.0.0.1:8001' },
+        { provider: 'strata-local', endpoint: 'http://127.0.0.1:8080' },
+      ],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toBe(null)
+  })
+
+  it('automaticFallback:true WITHOUT explicit model => null (fail-closed)', async () => {
+    const ctx = await service({
+      placement: [{ provider: 'qwen-local-3090', endpoint: 'http://127.0.0.1:8002', automaticFallback: true }],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toBe(null)
+  })
+
+  it('skips owner-approval and dual-GPU routes to reach the eligible primary', async () => {
+    const ctx = await service({
+      placement: [
+        { provider: 'qwen-local-dual', endpoint: 'http://127.0.0.1:8000', automaticFallback: true, model: 'dual-model' },
+        { provider: 'strata-local', endpoint: 'http://127.0.0.1:8080', automaticFallback: true, model: 'strata-model' },
+        { provider: 'qwen-local-3090', endpoint: 'http://127.0.0.1:8002', automaticFallback: true, model: 'glm-5.3-flash' },
+      ],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toEqual({ provider: 'qwen-local-dual', model: 'dual-model' })
+  })
+
+  it('qwen-local RTX 3090 Ti unflagged => never selected as fallback', async () => {
+    const ctx = await service({
+      placement: [
+        { provider: 'qwen-local', endpoint: 'http://127.0.0.1:8001' },
+        { provider: 'qwen-local-3090', endpoint: 'http://127.0.0.1:8002', automaticFallback: true, model: 'glm-5.3-flash' },
+      ],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toEqual({ provider: 'qwen-local-3090', model: 'glm-5.3-flash' })
+  })
+
+  it('strata-local RTX 3090 Ti unflagged => never selected as fallback', async () => {
+    const ctx = await service({
+      placement: [
+        { provider: 'strata-local', endpoint: 'http://127.0.0.1:8080' },
+        { provider: 'qwen-local-3090', endpoint: 'http://127.0.0.1:8002', automaticFallback: true, model: 'glm-5.3-flash' },
+      ],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toEqual({ provider: 'qwen-local-3090', model: 'glm-5.3-flash' })
+  })
+
+  it('keeps eligibility opt-in per target rather than name-based', async () => {
+    const ctx = await service({
+      placement: [{ provider: 'qwen-local-3090', endpoint: 'http://127.0.0.1:8002' }],
+    })
+    expect(ctx.agentDefaultModel.findFallbackProvider()).toBe(null)
+  })
 })

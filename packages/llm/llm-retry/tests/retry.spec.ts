@@ -1067,3 +1067,495 @@ describe('provider-routed retry policy', () => {
     }).toThrow(/unknown key "retryPolciy"/)
   })
 })
+
+describe('inter-provider fallback', () => {
+  it('primary succeeds → no fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([textResponse('success')])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }))
+    const agent = await context.agentLoop.create(SessionId('fallback-primary-ok'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await idle
+    expect(adapter.requests).toHaveLength(1)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+  })
+
+  it('SERVER after retry exhaustion → one authorized fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      textResponse('after fallback'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-server'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    expect(adapter.requests).toHaveLength(4)
+    expect(adapter.requests[3].provider).toBe('other')
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(true)
+  })
+
+  it('TIMEOUT → one authorized fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('timeout', 'TIMEOUT'),
+      new LlmError('timeout', 'TIMEOUT'),
+      new LlmError('timeout', 'TIMEOUT'),
+      textResponse('after fallback'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-timeout'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    expect(adapter.requests).toHaveLength(4)
+    expect(adapter.requests[3].provider).toBe('other')
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(true)
+  })
+
+  it('TRANSPORT → one authorized fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('transport error', 'TRANSPORT'),
+      new LlmError('transport error', 'TRANSPORT'),
+      new LlmError('transport error', 'TRANSPORT'),
+      textResponse('after fallback'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-transport'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    expect(adapter.requests).toHaveLength(4)
+    expect(adapter.requests[3].provider).toBe('other')
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(true)
+  })
+
+  it('EMPTY_RESPONSE → one authorized fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      emptyCompletion(),
+      emptyCompletion(),
+      emptyCompletion(),
+      textResponse('after fallback'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-empty'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    expect(adapter.requests).toHaveLength(4)
+    expect(adapter.requests[3].provider).toBe('other')
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(true)
+  })
+
+  it('AUTH → fail closed (no fallback)', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('bad key', 'AUTH'),
+      new LlmError('bad key', 'AUTH'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, undefined, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-auth'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await idle
+    // AUTH is not retryable → no retry, no fallback → only 1 request
+    expect(adapter.requests).toHaveLength(1)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+  })
+
+  it('QUOTA → fail closed (no fallback)', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('quota exceeded', 'QUOTA'),
+      new LlmError('quota exceeded', 'QUOTA'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, undefined, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-quota'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await idle
+    expect(adapter.requests).toHaveLength(1)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+  })
+
+  it('CONTEXT_WINDOW_EXCEEDED → fail closed (no fallback)', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('too long', 'CONTEXT_WINDOW_EXCEEDED'),
+      new LlmError('too long', 'CONTEXT_WINDOW_EXCEEDED'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, undefined, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-context-window'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await idle
+    expect(adapter.requests).toHaveLength(1)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+  })
+
+  it('NO_MODEL → fail closed (no fallback)', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('no model', 'NO_MODEL'),
+      new LlmError('no model', 'NO_MODEL'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, undefined, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-no-model'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await idle
+    expect(adapter.requests).toHaveLength(1)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+  })
+
+  it('no eligible fallback → fail closed', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, undefined, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-no-eligible'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    expect(adapter.requests).toHaveLength(3)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+  })
+
+  it('fallback fails → no second fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      new LlmError('fallback also failed', 'SERVER'),
+      new LlmError('fallback retry 1', 'SERVER'),
+      new LlmError('fallback retry 2', 'SERVER'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig(), other: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-no-retry'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    // Each provider retires its own retries; the turn ends after exactly one
+    // inter-provider transition.
+    expect(adapter.requests).toHaveLength(6)
+    expect(agent.session.snapshotEvents().filter(event => event.type === 'llm/fallback')).toHaveLength(1)
+    expect(agent.session.snapshotEvents().at(-1)).toMatchObject({
+      type: 'turn/end',
+      data: { reason: { kind: 'error', error: { code: 'SERVER' } } },
+    })
+  })
+
+  it('persistent/default provider remains unchanged after fallback', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      textResponse('after fallback'),
+      textResponse('next turn'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-provider-unchanged'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    // Production hosts install model selection that re-imposes the owner route
+    // on every request; emulate it so the next turn restores the persistent
+    // provider after the one-shot fallback override within the failing turn.
+    agent.ctx.on('agent/request', async (_payload, next) => {
+      const config = await next()
+      return { ...config, provider: 'mock', model: 'mock' }
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    expect(adapter.requests).toHaveLength(4)
+    expect(adapter.requests[3].provider).toBe('other')
+    // The persistent default route survives the one-shot fallback override.
+    expect(agent.options.provider).toBe('mock')
+    const nextIdle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'again' }], source: { kind: 'user' } }))
+    await nextIdle
+    expect(adapter.requests).toHaveLength(5)
+    expect(adapter.requests[4].provider).toBe('mock')
+    expect(agent.session.snapshotEvents().filter(event => event.type === 'llm/fallback')).toHaveLength(1)
+  })
+
+  it('fallback event/evidence is emitted with correct fields', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      new LlmError('server error', 'SERVER'),
+      textResponse('after fallback'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+        findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+      } as never)
+    }, { random: () => 0 }))
+    const agent = await context.agentLoop.create(SessionId('fallback-event-evidence'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await vi.runAllTimersAsync()
+    await idle
+    const fallbackEvent = agent.session.snapshotEvents().find(event => event.type === 'llm/fallback')
+    expect(fallbackEvent).toBeDefined()
+    expect(fallbackEvent?.data).toMatchObject({
+      failedProvider: 'mock',
+      failedModel: 'mock',
+      failureCode: 'SERVER',
+      candidateProvider: 'other',
+      candidateModel: 'mock',
+      attempt: 1,
+      excludedRoutes: [],
+    })
+  })
+
+  describe('inter-provider fallback — explicit model identity', () => {
+    it('uses candidate model, not the failed primary model (req 4)', async () => {
+      vi.useFakeTimers()
+      const adapter = new ScriptedAdapter([
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        textResponse('after fallback'),
+      ])
+      ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+        ctx.provide('agentDefaultModel', {
+          currentSelection: () => ({ provider: 'mock', model: 'qwen-local-model' }),
+          findFallbackProvider: () => ({ provider: 'other', model: 'glm-5.3-flash' }),
+        } as never)
+      }, { random: () => 0 }))
+      const agent = await context.agentLoop.create(SessionId('fallback-candidate-model'), {
+        provider: 'mock',
+        model: 'mock',
+      })
+      const idle = waitForIdle(context, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await vi.runAllTimersAsync()
+      await idle
+      expect(adapter.requests[3].model).toBe('glm-5.3-flash')
+    })
+
+    it('candidate provider change AND candidate model change together (req 5)', async () => {
+      vi.useFakeTimers()
+      const adapter = new ScriptedAdapter([
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        textResponse('after fallback'),
+      ])
+      ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+        ctx.provide('agentDefaultModel', {
+          currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+          findFallbackProvider: () => ({ provider: 'other', model: 'other-model' }),
+        } as never)
+      }, { random: () => 0 }))
+      const agent = await context.agentLoop.create(SessionId('fallback-both-changed'), {
+        provider: 'mock',
+        model: 'mock',
+      })
+      const idle = waitForIdle(context, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await vi.runAllTimersAsync()
+      await idle
+      expect(adapter.requests[3].provider).toBe('other')
+      expect(adapter.requests[3].model).toBe('other-model')
+    })
+
+    it('candidate lacking explicit model → fail closed (req 6)', async () => {
+      vi.useFakeTimers()
+      const adapter = new ScriptedAdapter([
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+      ])
+      ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+        ctx.provide('agentDefaultModel', {
+          currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+          findFallbackProvider: () => null,
+        } as never)
+      }, { random: () => 0 }))
+      const agent = await context.agentLoop.create(SessionId('fallback-no-model'), {
+        provider: 'mock',
+        model: 'mock',
+      })
+      const idle = waitForIdle(context, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await vi.runAllTimersAsync()
+      await idle
+      expect(adapter.requests).toHaveLength(3)
+      expect(agent.session.snapshotEvents().some(event => event.type === 'llm/fallback')).toBe(false)
+    })
+
+    it('persistent primary provider remains unchanged (req 7)', async () => {
+      vi.useFakeTimers()
+      const adapter = new ScriptedAdapter([
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        textResponse('after fallback'),
+      ])
+      ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+        ctx.provide('agentDefaultModel', {
+          currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+          findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+        } as never)
+      }, { random: () => 0 }))
+      const agent = await context.agentLoop.create(SessionId('fallback-primary-unchanged'), {
+        provider: 'mock',
+        model: 'mock',
+      })
+      const idle = waitForIdle(context, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await vi.runAllTimersAsync()
+      await idle
+      expect(agent.options.provider).toBe('mock')
+    })
+
+    it('persistent primary model remains unchanged (req 8)', async () => {
+      vi.useFakeTimers()
+      const adapter = new ScriptedAdapter([
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        textResponse('after fallback'),
+      ])
+      ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+        ctx.provide('agentDefaultModel', {
+          currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+          findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+        } as never)
+      }, { random: () => 0 }))
+      const agent = await context.agentLoop.create(SessionId('fallback-model-unchanged'), {
+        provider: 'mock',
+        model: 'mock',
+      })
+      const idle = waitForIdle(context, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await vi.runAllTimersAsync()
+      await idle
+      expect(agent.options.model).toBe('mock')
+    })
+
+    it('llm/fallback audit event contains all required fields (req 10)', async () => {
+      vi.useFakeTimers()
+      const adapter = new ScriptedAdapter([
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        new LlmError('server error', 'SERVER'),
+        textResponse('after fallback'),
+      ])
+      ;({ ctx: context } = await harness(adapter, { mock: normalConfig() }, (ctx) => {
+        ctx.provide('agentDefaultModel', {
+          currentSelection: () => ({ provider: 'mock', model: 'mock' }),
+          findFallbackProvider: () => ({ provider: 'other', model: 'mock' }),
+        } as never)
+      }, { random: () => 0 }))
+      const agent = await context.agentLoop.create(SessionId('fallback-audit-fields'), {
+        provider: 'mock',
+        model: 'mock',
+      })
+      const idle = waitForIdle(context, agent)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      await vi.runAllTimersAsync()
+      await idle
+      const fallbackEvent = agent.session.snapshotEvents().find(event => event.type === 'llm/fallback')
+      expect(fallbackEvent).toBeDefined()
+      expect(fallbackEvent?.data).toMatchObject({
+        failedProvider: 'mock',
+        failedModel: 'mock',
+        failureCode: 'SERVER',
+        candidateProvider: 'other',
+        candidateModel: 'mock',
+        attempt: 1,
+        excludedRoutes: [],
+      })
+    })
+  })
+})

@@ -13,6 +13,7 @@ import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-config-editor'
 import { decidePlacement, probeEndpoint, type PlacementTarget } from './placement.ts'
+export type { PlacementTarget } from './placement.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -63,6 +64,8 @@ export class AgentDefaultModelConfig extends Service {
     placement: z.array(z.object({
       provider: z.string(),
       endpoint: z.string(),
+      automaticFallback: z.boolean().required(false),
+      model: z.string().required(false),
     })).volatile(),
     placementProbeTimeoutMs: z.number().step(1).min(1).default(2000).volatile(),
   })
@@ -83,6 +86,23 @@ export class AgentDefaultModelConfig extends Service {
       provider: this.config.provider.get(), model: this.config.model.get(),
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
     })
+  }
+
+  /**
+   * Find the first placement target with `automaticFallback` set to true,
+   * returning its provider route and explicit model identity. Returns `null`
+   * when no target qualifies or the candidate lacks an explicit model (fail-
+   * closed). The source implementation defaults to no target having this flag,
+   * keeping inter-provider fallback disabled until profile activation.
+   * @returns the eligible fallback candidate identity, or `null`.
+   */
+  findFallbackProvider(): Pick<PlacementTarget, 'provider' | 'model'> | null {
+    const targets = this.config.placement.get()
+    if (targets === undefined || targets.length === 0) return null
+    const fallback = targets.find(target => target.automaticFallback === true)
+    if (fallback === undefined) return null
+    if (fallback.model === undefined) return null
+    return { provider: fallback.provider, model: fallback.model }
   }
 
   /**
@@ -122,6 +142,7 @@ export class AgentDefaultModelConfig extends Service {
     this.saves = saved.catch(() => {})
     await saved
   }
+
 }
 
 export default AgentDefaultModelConfig

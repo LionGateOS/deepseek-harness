@@ -15,6 +15,14 @@ export interface PlacementTarget {
   readonly provider: string
   /** llama.cpp HTTP base without `/v1`, for example `http://127.0.0.1:8001`. */
   readonly endpoint: string
+  /** Whether this target is eligible for automatic inter-provider fallback. */
+  readonly automaticFallback?: boolean
+  /**
+   * Explicit model identity for the candidate. Required when
+   * `automaticFallback` is true; omitting it causes fail-closed
+   * behavior in the fallback path.
+   */
+  readonly model?: string
 }
 
 /** Observed state of one placement endpoint from a single probe pass. */
