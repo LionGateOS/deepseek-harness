@@ -1,0 +1,215 @@
+- insert:
+    - id: local-model-manager
+      name: '@local/local-model-manager'
+      config:
+        endpointBase: http://127.0.0.1:8001
+        launcherPath: /home/liongateos/.local/share/liongateos/deepseek-harness-local-models/dsh-model-server
+        providerPatchPath: /home/liongateos/.dsh/profiles/web/cordis.patch.yml
+        settingsPath: /home/liongateos/.dsh/settings.yaml
+        caseGpuUuid: GPU-4144e557-ad9a-83b3-014a-61f67141c547
+        caseGpuName: RTX 3090
+        protectedGpuUuid: GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+        protectedGpuName: RTX 3090 Ti
+        vllmBinPath: /home/liongateos/.local/bin/vllm
+        probeTimeoutMs: 3000
+        actionTimeoutMs: 300000
+        confirmTtlMs: 300000
+        maxErrorRecords: 20
+        models:
+          - key: qwen27
+            name: Qwen3.8 27B Uncensored Q8
+            ggufPath: /mnt/LiongateOS-AI-4TB/LLM/gguf/Qwen3.8-27B/Qwen3.8-27B-Uncensored-Q8_0.gguf
+            switchName: qwen27
+            engineBinary: stable
+          - key: vision
+            name: Qwen3.8 27B HauhauCS Vision
+            ggufPath: /mnt/LiongateOS-AI-4TB/LLM/gguf/Qwen3.8-27B-HauhauCS-Vision/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf
+            switchName: vision
+            engineBinary: stable
+            vision: true
+            mmprojPath: /mnt/LiongateOS-AI-4TB/LLM/gguf/Qwen3.8-27B-HauhauCS-Vision/mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
+          - key: qwen36
+            name: Qwen3.6 35B A3B Abliterated v4 Q4_K_M
+            ggufPath: /mnt/LiongateOS-AI-4TB/LLM/gguf/Qwen3.6-35B-A3B-abliterated-v4/Qwen3.6-35B-A3B-abliterated-v4-Q4_K_M.gguf
+            switchName: qwen36
+            engineBinary: stable
+          - key: laguna
+            name: Laguna XS 2.1 Q4_K_M
+            ggufPath: /mnt/LiongateOS-AI-4TB/LLM/gguf/Laguna-XS-2.1-Q4_K_M/Laguna-XS-2.1-Q4_K_M.gguf
+            switchName: laguna
+            engineBinary: stable
+        discoveryDirs:
+          - /mnt/LiongateOS-AI-4TB/LLM/gguf
+        discoveryResultsPath: /home/liongateos/.local/share/liongateos/deepseek-update/gguf-discovery-cache.json
+        userDiscoveryDirsPath: /home/liongateos/.local/share/liongateos/deepseek-update/user-discovery-dirs.json
+        # GPU policy (2026-10-23): no GPU is reserved automatically. The RTX 3090 Ti is the
+        # preferred launch target, the RTX 3090 second, Both third. A manual Reserve/Release
+        # through My Graphics Cards persists to gpuLaunchStatePath; absence of the file or of
+        # an entry means unreserved, and nothing re-applies a reservation.
+        preferredLaunchGpuUuid: GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+        gpuLaunchStatePath: /home/liongateos/.local/share/liongateos/deepseek-update/gpu-launch-state.json
+        # Context configuration: selections persist across restarts; the
+        # reservation values must mirror the compaction-basic modelPolicies
+        # configured for this local route in the web profile's cordis.yml.
+        # Electricity (Phase 2): one sample a second from the same nvidia-smi
+        # query the GPU cards already use, kept in a bounded ring in memory and
+        # priced at the Ontario TOU rate that applied to each interval. Board
+        # power only. Nothing is written to disk, and no second poller exists.
+        powerSamplingEnabled: true
+        powerRingCapacity: 7200
+        powerSampleIntervalMs: 1000
+        # The card whose board power is priced per job: Strata runs on the Ti.
+        tariffGpuUuid: GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+        contextSelectionsPath: /home/liongateos/.local/share/liongateos/deepseek-update/context-selections.json
+        reservedOutputTokens: 8192
+        headroomTokens: 16384
+        allowedGpuUuids:
+          - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+          - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+        # Multi-instance: candidate launcher and per-GPU server instances.
+        # Each instance binds one loopback port to one GPU UUID. The candidate
+        # launcher is called instead of the installed launcher for these operations.
+        # The stable installed path below must exist before per-instance Start/Stop
+        # controls become functional; see ACTIVATION.md for the installation step.
+        candidateLauncherPath: /home/liongateos/.local/share/liongateos/deepseek-harness-local-models/dsh-model-server-candidate
+        instances:
+          - port: 8001
+            gpuUuid: GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuName: RTX 3090 Ti
+          - port: 8002
+            gpuUuid: GPU-4144e557-ad9a-83b3-014a-61f67141c547
+            gpuName: RTX 3090
+        # Endpoints this manager watches but does not launch. Strata (:8080) is a
+        # system-level server serving DeepSeek V4.1 Flash on the Ti; the manager
+        # never starts or stops it. Naming it here is what lets a Session that
+        # reached that loopback route prove which card is behind it instead of
+        # matching on the model name. Observation only — no control surface.
+        localEndpoints:
+          - port: 8080
+            gpuUuid: GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuName: RTX 3090 Ti
+        launchProfiles:
+          - profileId: qwen27-ti
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: qwen27
+            gpuUuids:
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: single
+            launchArgs: []
+            label: Qwen3.8 27B Uncensored Q8 — RTX 3090 Ti
+            notes: "Preferred launch target — first choice: profile launches need no release step; a manual lock on this GPU would refuse them. Unverified on this GPU, so a supervised first launch is recommended."
+          - profileId: qwen27-case
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: qwen27
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+            gpuMode: single
+            launchArgs: []
+            label: Qwen3.8 27B Uncensored Q8 — RTX 3090
+            notes: "Second choice — verified, uses the production RTX 3090 launch path."
+          - profileId: qwen27-both
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: qwen27
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: both
+            launchArgs: []
+            label: Qwen3.8 27B Uncensored Q8 — Both GPUs
+            notes: "Third choice — unverified; uses both GPUs. A supervised first launch is recommended, and a manual lock on either GPU would refuse it."
+          - profileId: vision-ti
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: vision
+            gpuUuids:
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: single
+            launchArgs: []
+            label: Qwen3.8 27B HauhauCS Vision — RTX 3090 Ti
+            notes: "Preferred launch target — first choice: profile launches need no release step; a manual lock on this GPU would refuse them. Unverified on this GPU, so a supervised first launch is recommended."
+          - profileId: vision-case
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: vision
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+            gpuMode: single
+            launchArgs: []
+            label: Qwen3.8 27B HauhauCS Vision — RTX 3090
+            notes: "Second choice — verified, uses the production RTX 3090 launch path."
+          - profileId: vision-both
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: vision
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: both
+            launchArgs: []
+            label: Qwen3.8 27B HauhauCS Vision — Both GPUs
+            notes: "Third choice — unverified; uses both GPUs. A supervised first launch is recommended, and a manual lock on either GPU would refuse it."
+          - profileId: qwen36-ti
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: qwen36
+            gpuUuids:
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: single
+            launchArgs: []
+            label: Qwen3.6 35B A3B Abliterated v4 Q4_K_M — RTX 3090 Ti
+            notes: "Preferred launch target — first choice. Supervised first launch recommended."
+          - profileId: qwen36-case
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: qwen36
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+            gpuMode: single
+            launchArgs: []
+            label: Qwen3.6 35B A3B Abliterated v4 Q4_K_M — RTX 3090
+            notes: "Second choice. Supervised first launch recommended."
+          - profileId: qwen36-both
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: qwen36
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: both
+            launchArgs: []
+            label: Qwen3.6 35B A3B Abliterated v4 Q4_K_M — Both GPUs
+            notes: "Third choice — both GPUs. Supervised first launch recommended."
+          - profileId: laguna-ti
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: laguna
+            gpuUuids:
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: single
+            launchArgs: []
+            label: Laguna XS 2.1 Q4_K_M — RTX 3090 Ti
+            notes: "Preferred launch target — first choice. Supervised first launch recommended."
+          - profileId: laguna-case
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: laguna
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+            gpuMode: single
+            launchArgs: []
+            label: Laguna XS 2.1 Q4_K_M — RTX 3090
+            notes: "Second choice. Supervised first launch recommended."
+          - profileId: laguna-both
+            engineId: llama.cpp
+            engineVersion: stable
+            modelKey: laguna
+            gpuUuids:
+              - GPU-4144e557-ad9a-83b3-014a-61f67141c547
+              - GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0
+            gpuMode: both
+            launchArgs: []
+            label: Laguna XS 2.1 Q4_K_M — Both GPUs
+            notes: "Third choice — both GPUs. Supervised first launch recommended."

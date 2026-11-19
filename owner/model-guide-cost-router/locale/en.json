@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "title": "Model Guide & Cost Router",
+    "description": "Owner-curated model guidance overlaid on live provider discovery: reasoning settings, token rates, restrictions, and read-only agent guidance under the least-expensive-capable-model routing rule."
+  },
+  "engineUpdate": {
+    "sectionTitle": "Inference Engine Releases",
+    "sectionDescription": "Latest upstream release versions for registered inference engines, checked from official GitHub release sources. No engine is installed or activated automatically.",
+    "statusSuccess": "Release recorded",
+    "statusError": "Check failed — previous data preserved",
+    "statusNotChecked": "Not yet checked",
+    "installedLabel": "Installed",
+    "latestLabel": "Latest upstream",
+    "releasedAtLabel": "Released",
+    "lastCheckLabel": "Last checked",
+    "updateAvailable": "Newer release available",
+    "noUpdateAvailable": "Up to date",
+    "unknownInstalled": "Not detected",
+    "updateEnginesButton": "Check Engine Releases",
+    "distinctionNote": "An available upstream release does not indicate the engine is installed, and an installed version does not indicate it has passed verification with any specific model or GPU combination."
+  },
+  "engineVerification": {
+    "sectionTitle": "Verified Configurations",
+    "sectionDescription": "Owner-recorded test evidence for specific engine/model/GPU combinations. A verification is only recorded after an actual test; it is never inferred from the installed version or the available upstream release.",
+    "resultPassed": "Passed",
+    "resultFailed": "Failed",
+    "modelLabel": "Model",
+    "gpusLabel": "GPUs",
+    "verifiedAtLabel": "Verified",
+    "evidenceLabel": "Evidence",
+    "noVerified": "No verified configurations recorded for this engine.",
+    "distinctionNote": "A verified configuration means the owner ran a real test with this exact engine version, model, and GPU set. It does not mean the configuration is currently installed or that it will work after any software change."
+  }
+}

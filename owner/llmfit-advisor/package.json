@@ -1,0 +1,22 @@
+{
+  "name": "@local/llmfit-advisor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded read-only advisory adapter over the pinned llmfit model-fit engine: one model-facing tool, fixed argv, no shell, no authorized-capacity claim.",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "core/advisor.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

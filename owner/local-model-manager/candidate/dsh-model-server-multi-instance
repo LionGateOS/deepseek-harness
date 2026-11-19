@@ -1,0 +1,705 @@
+#!/usr/bin/env bash
+# dsh-model-server-multi-instance — CANDIDATE (not deployed)
+#
+# Extends dsh-model-server with per-instance port and GPU-UUID identity
+# verification. All existing commands work byte-for-byte identically when
+# neither MODEL_SERVER_PORT nor MODEL_SERVER_GPU_UUID is set.
+#
+# CANDIDATE STATUS: This file is under owner/local-model-manager/candidate/
+# and has never been copied to the installed launcher path:
+#   /home/liongateos/.local/share/liongateos/deepseek-harness-local-models/dsh-model-server
+# Do not deploy it without an explicit owner-approved deployment step.
+#
+# New behavior (only when the env variables below are set):
+#   MODEL_SERVER_PORT=8002    — run this instance on port 8002 instead of 8001
+#   MODEL_SERVER_GPU_UUID=... — the CUDA_VISIBLE_DEVICES value this instance
+#                               was launched with; stop/switch refuse to touch
+#                               a process using a different UUID (wrong-instance
+#                               guard). When unset, no GPU UUID check is done
+#                               (legacy behavior).
+#
+# Per-instance isolation:
+#   - port_in_use, wait_ready, show_status, safe_stop_known all target PORT
+#   - start_model writes logs as  .../<name>-p<PORT>.log
+#   - systemd unit names include  -p<PORT> suffix (unique per port)
+#   - same GGUF can run on two ports simultaneously under different GPU UUIDs
+#
+# Wrong-instance stop guard (safe_stop_known):
+#   When EXPECTED_GPU_UUID is set and the process owning PORT uses a different
+#   CUDA_VISIBLE_DEVICES value, the launcher prints a plain refusal and exits 8.
+#   It reads the GPU UUID from /proc/<pid>/environ (readable for own processes).
+#   Override _MOCK_PROC_ENV_FILE in tests to inject a fake environment file.
+#
+# Exit codes (superset of original):
+#   0  success
+#   2  usage error, invalid MODEL_SERVER_PORT, or unsafe runtime directory
+#   3  port already in use at start time, or concurrent start already in progress
+#   4  server did not become ready within 180 s
+#   5  port in use but owning PID could not be verified
+#   6  process on the port is not one of our known model servers
+#   7  verified server did not release the port after 30 s
+#   8  NEW — process on the port uses a different GPU UUID than expected
+#   9  NEW — process on the port exists but cannot be signalled (EPERM)
+#   10 NEW — ownership record absent, malformed, stale, or unverifiable (Option B)
+#
+# Ownership records (Option B — fail closed):
+#   Every start writes an ownership record to the per-port instance file:
+#     ${LOCK_DIR}/instance-p${PORT}.rec
+#   The record is written atomically (tmp→rename) only after wait_ready succeeds.
+#   safe_stop_known reads the record, queries the unit's MainPID via systemctl,
+#   and cross-checks it against the port-owning PID before authorizing the stop.
+#   If the record is absent, malformed, stale, or if any PID cross-check fails,
+#   the stop is refused with exit 10 and a recovery hint. Records are deleted on
+#   successful stop. This launcher never takes ownership of or stops a server it
+#   did not start.
+#
+#   Stale record (record present, port free) — a start on that port is blocked.
+#   Recovery: rm "${LOCK_DIR}/instance-p${PORT}.rec"
+#
+# PORT validation:
+#   MODEL_SERVER_PORT must be a plain decimal integer, 1–65535, no leading zeros.
+#   This is validated before any URL, filename, or unit name is constructed.
+#
+# Per-instance launch coordination:
+#   start_model acquires an exclusive flock on
+#     ${XDG_RUNTIME_DIR}/dsh-launcher/p<PORT>.lock   (preferred)
+#     ${HOME}/.local/state/dsh/launcher/p<PORT>.lock  (fallback)
+#   The lock directory must be owned by the current user; its permissions are
+#   set to 700 at every invocation. Concurrent starts for the same port fail
+#   immediately with exit 3; different ports use independent lock files.
+#
+# Test-mode injection:
+#   _DSH_LAUNCHER_TEST_MODE must contain a path to a readable sentinel FILE
+#   (not a fixed string like "1"). Tests create the sentinel in their temp dir
+#   so it is impossible to activate test mode via an inherited string value.
+#
+# Multiple Jobs (-np) mode: unchanged from the original. The installed launcher
+# hardcodes -np 1 for every model; this candidate does not change that.
+
+set -euo pipefail
+
+# ── Instance identity ──────────────────────────────────────────────────────────
+# PORT defaults to 8001 to preserve all legacy behavior.
+PORT="${MODEL_SERVER_PORT:-8001}"
+
+# Validate before constructing any URL, filename, unit name, or grep pattern.
+# Require a plain decimal integer 1–65535 with no leading zeros.
+# Leading zeros are forbidden because bash arithmetic treats them as octal.
+if ! [[ "$PORT" =~ ^[1-9][0-9]*$ ]] || (( 10#$PORT > 65535 )); then
+  printf 'ERROR: MODEL_SERVER_PORT="%s" is not a valid TCP port (1–65535, no leading zeros).\n' \
+    "${MODEL_SERVER_PORT:-<unset>}" >&2
+  exit 2
+fi
+
+BASE_URL="http://127.0.0.1:${PORT}"
+
+# When set, safe_stop_known refuses to stop a process using a different GPU UUID.
+EXPECTED_GPU_UUID="${MODEL_SERVER_GPU_UUID:-}"
+
+# ── Static paths (same as installed launcher) ──────────────────────────────────
+SETTINGS_FILE="${HOME}/.dsh/settings.yaml"
+PROFILE_PATCH="${HOME}/.dsh/profiles/web/cordis.patch.yml"
+
+STABLE_SERVER="/home/liongateos/build-tools/llama.cpp/build-cuda/bin/llama-server"
+
+QWEN27="/home/liongateos/models/gguf/Qwen3.8-27B/Qwen3.8-27B-Uncensored-Q8_0.gguf"
+QWEN35="/home/liongateos/models/gguf/Qwen3.5-27B-Q5_K_M/Qwen_Qwen3.5-27B-Q5_K_M.gguf"
+QWENVISION="/home/liongateos/models/gguf/Qwen3.8-27B-HauhauCS-Vision/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
+QWENVISION_MMPROJ="/home/liongateos/models/gguf/Qwen3.8-27B-HauhauCS-Vision/mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+QWENCODER="/home/liongateos/models/gguf/Qwen3-Coder-30B-A3B/qwen3-coder-30b-a3b-instruct-q8_0.gguf"
+QWEN36="/home/liongateos/models/gguf/Qwen3.6-35B-A3B-abliterated-v4/Qwen3.6-35B-A3B-abliterated-v4-Q4_K_M.gguf"
+LAGUNA="/home/liongateos/models/gguf/Laguna-XS-2.1-Q4_K_M/Laguna-XS-2.1-Q4_K_M.gguf"
+
+LOG_DIR="/home/liongateos/.local/share/liongateos/deepseek-harness-local-models/logs"
+mkdir -p "$LOG_DIR"
+
+# ── Test-mode activation ───────────────────────────────────────────────────────
+# _test_mode_active returns 0 (true) only when _DSH_LAUNCHER_TEST_MODE names a
+# readable sentinel file. Requiring a file path (not a fixed value like "1")
+# prevents activation via inherited string variables — the sentinel is created
+# by the test in its own temp directory and does not survive beyond that session.
+_test_mode_active() {
+  [ -n "${_DSH_LAUNCHER_TEST_MODE:-}" ] && [ -f "${_DSH_LAUNCHER_TEST_MODE}" ]
+}
+
+# ── Testable procfs helpers ────────────────────────────────────────────────────
+# Override these variables in tests to inject process facts without live
+# processes. When not in test mode, /proc/<pid>/… is read directly.
+#
+# _MOCK_PROC_CMDLINE_FILE — when set in test mode, _read_proc_cmdline reads
+#   this file instead of /proc/<pid>/cmdline. The file must contain the command
+#   line as space-separated tokens (same form as `tr '\0' ' '` on the real file).
+# _MOCK_PROC_ENV_FILE — when set in test mode, _read_proc_gpu_uuid reads this
+#   file instead of /proc/<pid>/environ. The file must contain lines of KEY=VALUE
+#   pairs (the null-byte separator already converted to newlines).
+
+_read_proc_cmdline() {
+  local pid="$1"
+  if _test_mode_active && [ -n "${_MOCK_PROC_CMDLINE_FILE:-}" ]; then
+    cat "$_MOCK_PROC_CMDLINE_FILE"
+  else
+    # || true: the redirect fails gracefully if the process has already exited.
+    # An empty result is handled by the caller's case statement (→ exit 6).
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true
+  fi
+}
+
+_read_proc_gpu_uuid() {
+  local pid="$1"
+  if _test_mode_active && [ -n "${_MOCK_PROC_ENV_FILE:-}" ]; then
+    grep '^CUDA_VISIBLE_DEVICES=' "${_MOCK_PROC_ENV_FILE}" 2>/dev/null | head -1 | cut -d= -f2-
+  else
+    # || true: graceful if the process has already exited (empty result → no UUID).
+    tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | grep '^CUDA_VISIBLE_DEVICES=' | head -1 | cut -d= -f2- || true
+  fi
+}
+
+# Queries MainPID for a transient systemd .service unit.
+# Returns the numeric PID string, or "0" if the unit is absent or stopped.
+# systemctl exits non-zero when the unit does not exist; || true converts that
+# to an empty result which the caller treats as "not running".
+_query_mainpid() {
+  local unit="$1"
+  local pid
+  pid="$(systemctl --user show "${unit}.service" --property=MainPID --value 2>/dev/null)" || true
+  printf '%s' "${pid:-0}"
+}
+
+# ── Private runtime lock directory ─────────────────────────────────────────────
+# Returns the path of the per-user launcher lock directory, creating and
+# securing it on every call. Fails closed (exit 2) if the directory cannot be
+# created, is owned by a different user, or its permissions cannot be set to
+# owner-only (700).
+#
+# Priority:
+#   ${XDG_RUNTIME_DIR}/dsh-launcher  — private per-user tmpfs (/run/user/<uid>)
+#   ${HOME}/.local/state/dsh/launcher — persistent user-private fallback
+_get_lock_dir() {
+  local dir
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR}" ]; then
+    dir="${XDG_RUNTIME_DIR}/dsh-launcher"
+  else
+    dir="${HOME}/.local/state/dsh/launcher"
+  fi
+
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    printf 'ERROR: cannot create launcher lock directory: %s\n' "$dir" >&2
+    exit 2
+  fi
+
+  # Verify ownership: another process may have pre-created the directory.
+  local uid dir_uid
+  uid="$(id -u)"
+  dir_uid="$(stat -c '%u' "$dir" 2>/dev/null)"
+  if [ "${dir_uid}" != "${uid}" ]; then
+    printf 'ERROR: lock directory %s is owned by UID %s, not current user (%s). Refusing.\n' \
+      "$dir" "${dir_uid:-<unknown>}" "${uid}" >&2
+    exit 2
+  fi
+
+  # Restrict to owner-only. A chmod failure means we do not own the directory
+  # (already caught by the ownership check, but belt-and-suspenders).
+  if ! chmod 700 "$dir" 2>/dev/null; then
+    printf 'ERROR: cannot set permissions on lock directory %s. Refusing.\n' "$dir" >&2
+    exit 2
+  fi
+
+  printf '%s' "$dir"
+}
+
+# ── context_for_model ──────────────────────────────────────────────────────────
+# Identical to the installed launcher. Reads the configured contextWindow for
+# a given model GGUF path from the provider config or settings YAML.
+
+context_for_model() {
+  local model="$1"
+  local fallback="$2"
+
+  if [ ! -f "$SETTINGS_FILE" ] && [ ! -f "$PROFILE_PATCH" ]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  python3 - "$SETTINGS_FILE" "$PROFILE_PATCH" "$model" "$fallback" <<'PYCTX'
+from pathlib import Path
+import sys
+import yaml
+
+wanted_model = sys.argv[3]
+fallback = sys.argv[4]
+
+def load_providers(settings_path, patch_path):
+    patch_file = Path(patch_path)
+    if patch_file.is_file():
+        try:
+            doc = yaml.safe_load(patch_file.read_text()) or []
+        except Exception:
+            doc = None
+        if isinstance(doc, list):
+            for entry in doc:
+                if isinstance(entry, dict) and entry.get("id") == "llm-pi-ai":
+                    found = (entry.get("config") or {}).get("providers")
+                    if isinstance(found, dict) and found:
+                        return found, str(patch_file)
+    settings_file = Path(settings_path)
+    if settings_file.is_file():
+        try:
+            data = yaml.safe_load(settings_file.read_text()) or {}
+        except Exception:
+            data = {}
+        found = (data.get("llm-pi-ai") or {}).get("providers") or {}
+        if found:
+            return found, str(settings_file)
+    return {}, None
+
+providers, _source = load_providers(sys.argv[1], sys.argv[2])
+try:
+    for provider in providers.values():
+        for model in provider.get("models", []):
+            if str(model.get("id", "")) == wanted_model:
+                ctx = model.get("contextWindow")
+                if isinstance(ctx, int) and ctx > 0:
+                    print(ctx)
+                    raise SystemExit(0)
+                if isinstance(ctx, str) and ctx.isdigit() and int(ctx) > 0:
+                    print(ctx)
+                    raise SystemExit(0)
+except Exception:
+    pass
+
+print(fallback)
+PYCTX
+}
+
+# ── Instance-scoped port helpers ───────────────────────────────────────────────
+
+port_in_use() {
+  ss -ltn 2>/dev/null | grep -q ":${PORT} "
+}
+
+wait_ready() {
+  local expected="$1"
+  local i
+  for i in $(seq 1 180); do
+    if curl -fsS --max-time 2 "${BASE_URL}/health" >/dev/null 2>&1; then
+      if curl -fsS --max-time 3 "${BASE_URL}/v1/models" | grep -Fq "$expected"; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# ── safe_stop_known ────────────────────────────────────────────────────────────
+# Locate the process owning PORT, verify ownership via the instance record and
+# systemd MainPID, then stop it gracefully.
+#
+# Authorization chain (all must pass before the kill is sent):
+#   1. Ownership record present and well-formed (exit 10 if not)
+#   2. Record's unit MainPID matches the ss-reported port-owning PID (exit 10)
+#   3. Process cmdline is a recognized model server (exit 6)
+#   4. GPU UUID matches EXPECTED_GPU_UUID when set (exit 8)
+#   5. Process is signallable; distinguish ESRCH from EPERM (exit 9)
+#
+# Failure modes (fail-closed — none of these try a force-kill):
+#   exit 5  — port in use but PID cannot be identified
+#   exit 6  — PID found but its cmdline is not a recognized model server
+#   exit 7  — verified server did not release the port within 30 s
+#   exit 8  — GPU UUID mismatch
+#   exit 9  — process exists but cannot be signalled (EPERM)
+#   exit 10 — ownership record absent, malformed, stale, or PID cross-check failed
+
+safe_stop_known() {
+  local lock_dir rec_file pid cmd
+
+  # Compute the lock dir once — exits 2 if the directory is unusable.
+  lock_dir="$(_get_lock_dir)"
+  rec_file="${lock_dir}/instance-p${PORT}.rec"
+
+  pid="$(ss -ltnp 2>/dev/null | sed -n "s/.*:${PORT} .*pid=\([0-9]*\).*/\1/p" | head -1)"
+
+  if [ -z "$pid" ]; then
+    if port_in_use; then
+      echo "REFUSED: port ${PORT} is in use but its owning PID could not be verified."
+      return 5
+    fi
+    # Port is free — check for a stale ownership record.
+    if [ -f "$rec_file" ]; then
+      echo "REFUSED: port ${PORT} is not in use, but a stale ownership record exists."
+      printf 'Record: %s\n' "$rec_file"
+      echo "The previous server may have crashed or been stopped externally."
+      printf 'To clear the stale record: rm "%s"\n' "$rec_file"
+      return 10
+    fi
+    echo "No model server is currently running on port ${PORT}."
+    return 0
+  fi
+
+  # Port IS in use — require an ownership record before touching anything.
+  if [ ! -f "$rec_file" ]; then
+    echo "REFUSED: port ${PORT} is in use by PID ${pid} but no ownership record exists."
+    echo "This launcher did not start this server, or the record was lost."
+    echo "To stop a legacy or unmanaged server, use the installed launcher."
+    return 10
+  fi
+
+  # Read and validate the record fields.
+  local rec_unit rec_gpu rec_model rec_port
+  rec_unit="$(grep  '^unit='  "$rec_file" | head -1 | cut -d= -f2-)"
+  rec_gpu="$(grep   '^gpu='   "$rec_file" | head -1 | cut -d= -f2-)"
+  rec_model="$(grep '^model=' "$rec_file" | head -1 | cut -d= -f2-)"
+  rec_port="$(grep  '^port='  "$rec_file" | head -1 | cut -d= -f2-)"
+
+  if [ -z "$rec_unit" ] || [ -z "$rec_gpu" ] || [ -z "$rec_model" ] || [ -z "$rec_port" ]; then
+    echo "REFUSED: malformed ownership record for port ${PORT} (missing required fields)."
+    printf 'Record: %s\n' "$rec_file"
+    printf 'To clear the malformed record: rm "%s"\n' "$rec_file"
+    return 10
+  fi
+
+  if [ "$rec_port" != "$PORT" ]; then
+    echo "REFUSED: ownership record port field (${rec_port}) does not match target port (${PORT})."
+    printf 'Record: %s\n' "$rec_file"
+    return 10
+  fi
+
+  # Cross-check: the recorded unit's MainPID must match the ss-reported PID.
+  local mainpid
+  mainpid="$(_query_mainpid "$rec_unit")"
+
+  if [ -z "$mainpid" ] || [ "$mainpid" = "0" ]; then
+    echo "REFUSED: ownership record names unit ${rec_unit} but that service is not active (MainPID absent or 0)."
+    echo "The server may have crashed or been stopped externally."
+    printf 'Record: %s\n' "$rec_file"
+    printf 'To clear the stale record: rm "%s"\n' "$rec_file"
+    return 10
+  fi
+
+  if [ "$mainpid" != "$pid" ]; then
+    echo "REFUSED: unit ${rec_unit} MainPID (${mainpid}) does not match port ${PORT} owner PID (${pid})."
+    echo "The port is occupied by a different process than the one this launcher started."
+    printf 'Record: %s\n' "$rec_file"
+    return 10
+  fi
+
+  # Verify the process cmdline is a recognized model server.
+  cmd="$(_read_proc_cmdline "$pid")"
+
+  case "$cmd" in
+    *"$STABLE_SERVER"*"$QWEN27"*|\
+    *"$STABLE_SERVER"*"$QWEN35"*|\
+    *"$STABLE_SERVER"*"$QWENVISION"*|\
+    *"$STABLE_SERVER"*"$QWENCODER"*|\
+    *"$STABLE_SERVER"*"$QWEN36"*|\
+    *"$STABLE_SERVER"*"$LAGUNA"*)
+      ;;
+    *)
+      echo "REFUSED: port ${PORT} is owned by an unexpected process."
+      echo "$cmd"
+      return 6
+      ;;
+  esac
+
+  # GPU identity check — only when EXPECTED_GPU_UUID is set.
+  if [ -n "$EXPECTED_GPU_UUID" ]; then
+    local actual_gpu
+    actual_gpu="$(_read_proc_gpu_uuid "$pid")"
+    if [ "$actual_gpu" != "$EXPECTED_GPU_UUID" ]; then
+      echo "REFUSED: port ${PORT} is owned by PID ${pid} using GPU ${actual_gpu:-<unknown>}."
+      echo "Expected GPU UUID: ${EXPECTED_GPU_UUID}"
+      echo "Stopping this process would terminate a different instance's model server."
+      return 8
+    fi
+  fi
+
+  # Distinguish ESRCH (process already exited) from EPERM (no permission to signal).
+  if ! kill -0 "$pid" 2>/dev/null; then
+    if [ -d "/proc/${pid}" ]; then
+      echo "REFUSED: PID ${pid} exists but cannot be signalled (permission denied)."
+      echo "No force-kill was attempted."
+      return 9
+    fi
+    echo "Process ${pid} already exited; waiting for port ${PORT} to clear."
+  else
+    echo "Stopping verified local model server PID ${pid} on port ${PORT} (unit: ${rec_unit})..."
+    kill "$pid" 2>/dev/null || true
+  fi
+
+  local i
+  for i in $(seq 1 30); do
+    if ! port_in_use; then
+      echo "Port ${PORT} is clear."
+      # Delete the ownership record only after the port is confirmed clear.
+      rm -f "$rec_file"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "REFUSED: verified process did not release port ${PORT} after 30 seconds."
+  echo "No force-kill was attempted."
+  return 7
+}
+
+# ── show_status ────────────────────────────────────────────────────────────────
+
+show_status() {
+  echo "=== DSH LOCAL MODEL SERVER STATUS ==="
+  echo "Endpoint: ${BASE_URL}"
+  echo
+
+  if ! curl -fsS --max-time 3 "${BASE_URL}/health" >/dev/null 2>&1; then
+    echo "Server: STOPPED"
+    return 0
+  fi
+
+  echo "Server: RUNNING"
+  echo
+
+  local model_json
+  model_json="$(curl -fsS --max-time 5 "${BASE_URL}/v1/models")"
+
+  if printf '%s' "$model_json" | grep -Fq "$QWENVISION"; then
+    echo "Model: Qwen3.8-27B HauhauCS Vision"
+  elif printf '%s' "$model_json" | grep -Fq "$QWEN35"; then
+    echo "Model: Qwen3.5-27B Q5_K_M"
+  elif printf '%s' "$model_json" | grep -Fq "$QWEN27"; then
+    echo "Model: Qwen3.8-27B Q8"
+  elif printf '%s' "$model_json" | grep -Fq "$QWENCODER"; then
+    echo "Model: Qwen3-Coder-30B-A3B Q8"
+  else
+    echo "Model: UNKNOWN"
+  fi
+
+  echo
+  printf '%s\n' "$model_json"
+}
+
+# ── start_model ────────────────────────────────────────────────────────────────
+# Starts a model server on PORT under a transient systemd user service.
+# Log file and unit name include the port so two instances never collide.
+#
+# On success, writes an ownership record atomically (tmp→rename):
+#   ${LOCK_DIR}/instance-p${PORT}.rec
+# If a record already exists for this port (stale or conflicting), the start is
+# refused with exit 10 and a recovery hint — it is never silently overwritten.
+#
+# Concurrent-start guard: an exclusive flock on ${LOCK_DIR}/p${PORT}.lock is
+# held for the duration of the launch sequence. A second concurrent start for
+# the same port fails immediately at the flock step (exit 3).
+
+start_model() {
+  local name="$1"
+  local bin="$2"
+  local model="$3"
+  shift 3
+
+  # Compute lock dir once; exits 2 if the directory is unusable.
+  local _lock_dir _lock_file _rec_file
+  _lock_dir="$(_get_lock_dir)"
+  _lock_file="${_lock_dir}/p${PORT}.lock"
+  _rec_file="${_lock_dir}/instance-p${PORT}.rec"
+
+  # Acquire the per-port advisory lock before any other checks.
+  exec 9>"${_lock_file}"
+  if ! flock -n 9; then
+    echo "REFUSED: another start for port ${PORT} is already in progress."
+    exit 3
+  fi
+
+  # Fail closed if an ownership record already exists for this port.
+  # This indicates either a running instance or a crash without cleanup.
+  if [ -f "$_rec_file" ]; then
+    echo "REFUSED: an ownership record already exists for port ${PORT}."
+    echo "An instance may still be running, or a previous run did not clean up properly."
+    printf 'Record: %s\n' "$_rec_file"
+    echo "Check server status: dsh-model-server-multi-instance status"
+    echo "If the server is stopped, clear the stale record:"
+    printf '  rm "%s"\n' "$_rec_file"
+    exit 10
+  fi
+
+  if port_in_use; then
+    echo "REFUSED: port ${PORT} is already in use."
+    echo "No process was stopped."
+    echo
+    show_status
+    exit 3
+  fi
+
+  # Per-instance log file — port suffix prevents two instances sharing a log.
+  local log="${LOG_DIR}/${name}-p${PORT}.log"
+
+  # Per-instance GPU UUID — passed by the LMM plugin via CUDA_VISIBLE_DEVICES.
+  # Fallback for direct invocations: RTX 3090 Ti (preferred per 2026-10-23 policy).
+  local cuda_uuid="${CUDA_VISIBLE_DEVICES:-GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0}"
+
+  # Per-instance systemd unit — timestamp + name + port; never collides across ports.
+  local unit_name="dsh-model-$(date +%s%3N)-${name}-p${PORT}"
+
+  echo "Starting ${name} on port ${PORT} (unit: ${unit_name})..."
+  systemd-run --user --no-ask-password \
+    --unit="${unit_name}" \
+    --description="Local Model Server ${name} port ${PORT}" \
+    --property="Environment=CUDA_VISIBLE_DEVICES=${cuda_uuid}" \
+    --property="StandardOutput=file:${log}" \
+    --property="StandardError=file:${log}" \
+    -- "$bin" \
+    "$@" \
+    -m "$model" \
+    --alias "$model" \
+    --host 127.0.0.1 \
+    --port "$PORT"
+
+  if wait_ready "$model"; then
+    # Write the ownership record atomically. The tmp file is in the same directory
+    # so mv is a rename(2) on the same filesystem — atomic on Linux.
+    local _rec_tmp="${_rec_file}.tmp.$$"
+    printf 'unit=%s\ngpu=%s\nmodel=%s\nport=%s\n' \
+      "$unit_name" "$cuda_uuid" "$model" "$PORT" \
+      > "$_rec_tmp"
+    mv -f "$_rec_tmp" "$_rec_file"
+
+    echo "READY: ${name} on port ${PORT}"
+    echo "Log: ${log}"
+    echo
+    show_status
+  else
+    echo "FAILED: ${name} did not become ready on port ${PORT}."
+    echo "Log: ${log}"
+    systemctl --user stop "${unit_name}" 2>/dev/null || true
+    exit 4
+  fi
+}
+
+# ── Command dispatch ───────────────────────────────────────────────────────────
+
+case "${1:-status}" in
+  status)
+    show_status
+    ;;
+
+  stop)
+    safe_stop_known
+    ;;
+
+  switch)
+    target="${2:-}"
+    case "$target" in
+      qwen27|qwen35|vision|coder|qwen36|laguna)
+        safe_stop_known
+        exec "$0" "start-${target}"
+        ;;
+      *)
+        echo "Usage: dsh-model-server-multi-instance switch {qwen27|qwen35|vision|coder|qwen36|laguna}"
+        exit 2
+        ;;
+    esac
+    ;;
+
+  start-qwen27)
+    start_model \
+      "qwen3.8-27b-q8" \
+      "$STABLE_SERVER" \
+      "$QWEN27" \
+      -c "$(context_for_model "$QWEN27" 131072)" \
+      -np 1 \
+      --flash-attn on \
+      --cache-type-k q8_0 \
+      --cache-type-v q8_0 \
+      "${@:2}"
+    ;;
+
+  start-qwen35)
+    start_model \
+      "qwen3.5-27b-q5-k-m" \
+      "$STABLE_SERVER" \
+      "$QWEN35" \
+      -c "$(context_for_model "$QWEN35" 65536)" \
+      -np 1 \
+      --flash-attn on \
+      --cache-type-k q8_0 \
+      --cache-type-v q8_0 \
+      "${@:2}"
+    ;;
+
+  start-vision)
+    start_model \
+      "qwen3.8-27b-hauhaucs-vision" \
+      "$STABLE_SERVER" \
+      "$QWENVISION" \
+      -c "$(context_for_model "$QWENVISION" 131072)" \
+      -np 1 \
+      --mmproj "$QWENVISION_MMPROJ" \
+      --flash-attn on \
+      --cache-type-k q8_0 \
+      --cache-type-v q8_0 \
+      --image-min-tokens 1024 \
+      "${@:2}"
+    ;;
+
+  start-coder)
+    start_model \
+      "qwen3-coder-30b-a3b-q8" \
+      "$STABLE_SERVER" \
+      "$QWENCODER" \
+      -c "$(context_for_model "$QWENCODER" 65536)" \
+      -np 1 \
+      --flash-attn on \
+      --cache-type-k q8_0 \
+      --cache-type-v q8_0 \
+      "${@:2}"
+    ;;
+
+  start-qwen36)
+    # NOTE (2026-11-10): The active provider config registers Qwen3.6 at contextWindow 262144.
+    # context_for_model reads that value from the patch file, so the 65536 fallback is not
+    # reached under normal operation. The fallback is only used if the patch file is absent.
+    # DEPLOYMENT NOTE: This candidate uses symlink paths (/home/liongateos/models/gguf/...).
+    # The live launcher uses real NVMe paths (/mnt/LiongateOS-AI-4TB/LLM/gguf/...).
+    # Update QWEN36 and LAGUNA path variables before deploying this candidate.
+    start_model \
+      "qwen3.6-35b-a3b-abliterated-v4-q4-k-m" \
+      "$STABLE_SERVER" \
+      "$QWEN36" \
+      -c "$(context_for_model "$QWEN36" 65536)" \
+      -np 1 \
+      --flash-attn on \
+      --cache-type-k q8_0 \
+      --cache-type-v q8_0 \
+      "${@:2}"
+    ;;
+
+  start-laguna)
+    start_model \
+      "laguna-xs-2.1-q4-k-m" \
+      "$STABLE_SERVER" \
+      "$LAGUNA" \
+      -c "$(context_for_model "$LAGUNA" 65536)" \
+      -np 1 \
+      --flash-attn on \
+      --cache-type-k q8_0 \
+      --cache-type-v q8_0 \
+      "${@:2}"
+    ;;
+
+
+  *)
+    echo "Usage:"
+    echo "  dsh-model-server-multi-instance status"
+    echo "  dsh-model-server-multi-instance stop"
+    echo "  dsh-model-server-multi-instance switch {qwen27|qwen35|vision|coder|qwen36|laguna}"
+    echo "  dsh-model-server-multi-instance start-qwen27"
+    echo "  dsh-model-server-multi-instance start-qwen35"
+    echo "  dsh-model-server-multi-instance start-vision"
+    echo "  dsh-model-server-multi-instance start-coder"
+    echo "  dsh-model-server-multi-instance start-qwen36"
+    echo "  dsh-model-server-multi-instance start-laguna"
+    echo ""
+    echo "Instance environment variables (all optional):"
+    echo "  MODEL_SERVER_PORT=8001       port this instance listens on (default: 8001)"
+    echo "  MODEL_SERVER_GPU_UUID=<uuid> expected CUDA_VISIBLE_DEVICES for stop guard"
+    exit 2
+    ;;
+esac

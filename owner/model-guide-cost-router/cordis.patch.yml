@@ -1,0 +1,26 @@
+- insert:
+    - id: model-guide-cost-router
+      name: '@local/model-guide-cost-router'
+      config:
+        ownerMetadataPath: /home/liongateos/.local/share/liongateos/model-guidance/owner-model-guidance.json
+        guideMarkdownPath: /home/liongateos/.local/share/liongateos/model-guidance/LIONGATEOS_MODEL_AVAILABILITY_AND_REASONING_GUIDE.md
+        catalogPath: /home/liongateos/.local/share/liongateos/model-guidance/model-catalog.json
+        guideGeneratedPath: /home/liongateos/.local/share/liongateos/model-guidance/MODEL_GUIDE.generated.md
+        customizationStatusPath: /home/liongateos/.local/share/liongateos/deepseek-update/customization-status.json
+        pricingCheckUrls:
+          - https://ollama.com/pricing
+        maxPriceAgeDays: 90
+        providerQueryTimeoutMs: 4000
+        providerCacheMs: 60000
+        fetchTimeoutMs: 8000
+        maxCatalogHistory: 5
+        localDiscoveryCachePath: /home/liongateos/.local/share/liongateos/deepseek-update/gguf-discovery-cache.json
+        autoRefresh: true
+        autoRefreshHours: 6
+        # DSH Automatic Model Routing. Both switches default false in code;
+        # only the ask path is enabled here because no verified authority
+        # grants a silent automatic switch. A materially better verified model
+        # asks the owner once per turn; anything else routes silently or not
+        # at all, and the current model is kept on every bounded failure.
+        autoRouteAsk: true
+        autoRouteAskTimeoutMs: 60000

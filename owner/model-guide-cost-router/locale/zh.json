@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "title": "模型指南与成本路由",
+    "description": "将所有者策划的模型指引叠加到动态供应商发现之上：推理设置、令牌单价、限制说明，以及遵循\u201c够用便宜优先\u201d路由规则的只读智能体指引。"
+  },
+  "engineUpdate": {
+    "sectionTitle": "推理引擎版本",
+    "sectionDescription": "从官方 GitHub 发布来源检查的各已注册推理引擎最新上游版本。不会自动安装或激活任何引擎。",
+    "statusSuccess": "版本已记录",
+    "statusError": "检查失败——已保留之前的数据",
+    "statusNotChecked": "尚未检查",
+    "installedLabel": "已安装",
+    "latestLabel": "最新上游版本",
+    "releasedAtLabel": "发布时间",
+    "lastCheckLabel": "上次检查时间",
+    "updateAvailable": "有可用的新版本",
+    "noUpdateAvailable": "已是最新",
+    "unknownInstalled": "未检测到",
+    "updateEnginesButton": "检查引擎版本",
+    "distinctionNote": "可用的上游版本不表示引擎已安装，已安装的版本也不表示其已与特定模型或 GPU 组合通过验证。"
+  },
+  "engineVerification": {
+    "sectionTitle": "已验证配置",
+    "sectionDescription": "针对特定引擎/模型/GPU 组合的所有者记录测试证据。验证记录仅在实际测试完成后由所有者填写，绝不从已安装版本或可用上游版本推断。",
+    "resultPassed": "通过",
+    "resultFailed": "失败",
+    "modelLabel": "模型",
+    "gpusLabel": "GPU",
+    "verifiedAtLabel": "验证时间",
+    "evidenceLabel": "证据",
+    "noVerified": "该引擎尚无已记录的验证配置。",
+    "distinctionNote": "已验证配置表示所有者已使用这一精确的引擎版本、模型和 GPU 组合运行了真实测试。这不代表该配置当前已安装，也不代表任何软件变更后仍能正常工作。"
+  }
+}

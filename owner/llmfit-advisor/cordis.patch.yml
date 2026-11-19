@@ -1,0 +1,18 @@
+# LLMFIT Advisor — bounded read-only advisory adapter.
+#
+# llmfit is a calculation source only. This plugin exposes exactly one
+# model-facing tool (`llmfit_recommend`) that runs a fixed argv against the
+# pinned pilot binary and returns advisory fit records. It grants llmfit no
+# execution, routing, installed-model, reservation, or GPU authority, and it
+# never exposes `search`, `hf-search`, `update`, `download`, `run`, `bench`,
+# `serve`, or `cluster`.
+#
+# `cwd` is the child working directory: llmfit reads only its own bundled
+# catalog on the `recommend` path, so the workspace root is sufficient and no
+# repository path is written.
+- insert:
+    - id: llmfit-advisor
+      name: '@local/llmfit-advisor'
+      config:
+        cwd: /home/liongateos/deepseek-harness
+        timeoutMs: 20000

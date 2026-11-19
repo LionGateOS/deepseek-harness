@@ -1,0 +1,51 @@
+{
+  "name": "@local/local-model-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Model Manager: owner panel that discovers the installed local models and two GPUs, explains verified capabilities in plain language, and performs start/stop/switch only through the trusted allowlisted launcher with explicit owner confirmation and fail-closed safety checks.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "core/config.js",
+    "core/catalog.js",
+    "core/runtime.js",
+    "core/gpus.js",
+    "core/actions.js",
+    "core/profiles.js",
+    "core/engine-adapter.js",
+    "core/model-advisor-adapter.js",
+    "core/discovery.js",
+    "core/gpu-lock.js",
+    "core/user-dirs.js",
+    "core/gpu-launch-state.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "core/context-sizer.js",
+    "core/context-selections.js",
+    "core/strata-observer.js",
+    "core/strata-actions.js",
+    "core/gguf-meta.js",
+    "core/tariff.js",
+    "core/energy.js",
+    "core/power-sampler.js"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  }
+}

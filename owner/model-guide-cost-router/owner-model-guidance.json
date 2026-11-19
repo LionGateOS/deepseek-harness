@@ -1,0 +1,576 @@
+{
+  "version": 1,
+  "routingRule": "Cost-aware model routing: Use the least expensive model that can complete the task to the required quality, reliability, and safety. Prefer local or cheaper models when equally capable. Escalate to a more expensive model only when the cheaper option would materially compromise the result. Do not sacrifice quality merely to save money.",
+  "gpuBoundary": [
+    {
+      "label": "General / CASE / local-model GPU",
+      "gpuName": "NVIDIA RTX 3090",
+      "uuid": "GPU-4144e557-ad9a-83b3-014a-61f67141c547",
+      "role": "allowed: local model work (CASE / general)"
+    },
+    {
+      "label": "Protected GD RTX 3090 Ti",
+      "gpuName": "NVIDIA RTX 3090 Ti",
+      "uuid": "GPU-009aea9f-1bb8-d43b-b56a-abe166f629b0",
+      "role": "protected: never use, stop, restart, unload, or reconfigure for other model work without explicit owner approval"
+    }
+  ],
+  "models": {
+    "qwen-local//home/liongateos/models/gguf/Qwen3.8-27B/Qwen3.8-27B-Uncensored-Q8_0.gguf": {
+      "localVsCloud": "local",
+      "modalities": [
+        "text"
+      ],
+      "reasoningModes": [
+        "Low",
+        "Medium",
+        "XHigh"
+      ],
+      "nativeReasoningDefault": "XHigh",
+      "recommendedRoutine": "Medium",
+      "recommendedHeavy": "XHigh",
+      "reasoningNote": "Medium is the normal choice; XHigh can reason excessively and consume much more time; Low when speed matters and the task is straightforward. Do not assume XHigh is always better.",
+      "strengths": [
+        "general reasoning",
+        "repository analysis",
+        "code review",
+        "research synthesis",
+        "architecture critique",
+        "difficult local tasks where 27B quality is sufficient"
+      ],
+      "evidence": "Direct GGUF/provider metadata audit 2026-10-13; native GGUF default XHigh",
+      "pricingNote": "Local: no cloud/API token charge ($0 token charge); still consumes electricity, GPU time, and VRAM",
+      "contextConfigured": 131072
+    },
+    "qwen-local//home/liongateos/models/gguf/Qwen3.8-27B-HauhauCS-Vision/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf": {
+      "localVsCloud": "local",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "contextConfigured": 131072,
+      "reasoningModes": [
+        "Low",
+        "Medium",
+        "XHigh"
+      ],
+      "nativeReasoningDefault": "XHigh",
+      "recommendedRoutine": "Medium",
+      "recommendedHeavy": "XHigh",
+      "reasoningNote": "Use XHigh only when the visual/reasoning task is genuinely difficult.",
+      "strengths": [
+        "image-aware repository work",
+        "screenshots and UI inspection",
+        "document/image reasoning",
+        "multimodal tasks requiring local execution"
+      ],
+      "evidence": "Direct GGUF/provider metadata audit 2026-10-13; native GGUF default XHigh",
+      "pricingNote": "Local: no cloud/API token charge ($0 token charge)"
+    },
+    "qwen-local//home/liongateos/models/gguf/Qwen3-Coder-30B-A3B/qwen3-coder-30b-a3b-instruct-q8_0.gguf": {
+      "localVsCloud": "local",
+      "modalities": [
+        "text"
+      ],
+      "toolSupport": null,
+      "reasoningModes": [],
+      "reasoningNote": "Non-thinking model. Do not invent or expose reasoning levels for this model; no reasoning selector or default exists.",
+      "strengths": [
+        "bounded coding",
+        "implementation",
+        "code transformations",
+        "tasks where its coding specialization is useful"
+      ],
+      "evidence": "Direct GGUF/provider metadata audit 2026-10-13; reasoningEfforts disabled in provider config",
+      "pricingNote": "Local: no cloud/API token charge ($0 token charge)"
+    },
+    "qwen-local//home/liongateos/models/gguf/Qwen3.5-27B-Q5_K_M/Qwen_Qwen3.5-27B-Q5_K_M.gguf": {
+      "localVsCloud": "local",
+      "modalities": [
+        "text"
+      ],
+      "contextConfigured": 32768,
+      "reasoningModes": [
+        "Default",
+        "Low (2048 thinking tokens)",
+        "Medium (8192 thinking tokens)",
+        "High (16384 thinking tokens)"
+      ],
+      "reasoningNote": "IMPORTANT: Low/Medium/High are local llama.cpp synthetic thinking budgets (2048/8192/16384), NOT vendor-native Qwen3.5 named reasoning levels. Recommended routine setting is Default, which forces no explicit numeric thinking budget. Do not force one synthetic budget as the routine default.",
+      "recommendedRoutine": "Default",
+      "recommendedHeavy": "Medium or High budget, only when useful",
+      "strengths": [
+        "local 27B work when its size/quality tradeoff fits"
+      ],
+      "evidence": "Direct GGUF/provider metadata audit 2026-10-13; thinking budgets from provider config compat/thinkingBudgets",
+      "pricingNote": "Local: no cloud/API token charge ($0 token charge)"
+    },
+    "qwen-local//home/liongateos/models/gguf/Qwen3.6-35B-A3B-abliterated-v4/Qwen3.6-35B-A3B-abliterated-v4-Q4_K_M.gguf": {
+      "localVsCloud": "local",
+      "modalities": [
+        "text"
+      ],
+      "contextConfigured": 262144,
+      "reasoningModes": [
+        "Default",
+        "Low (2048 thinking tokens)",
+        "Medium (8192 thinking tokens)",
+        "High (16384 thinking tokens)"
+      ],
+      "reasoningNote": "IMPORTANT: Low/Medium/High are local llama.cpp synthetic thinking budgets (2048/8192/16384), NOT vendor-native Qwen3.6 named reasoning levels. Recommended routine setting is Default, which forces no explicit numeric thinking budget. Do not force one synthetic budget as the routine default.",
+      "recommendedRoutine": "Default",
+      "recommendedHeavy": "Medium or High budget, only when useful",
+      "strengths": [
+        "large context (262K native)",
+        "efficient MoE: 8 of 256 experts active per token (~3B active of 35B total parameters)",
+        "local 35B-class work at Q4_K_M quality"
+      ],
+      "evidence": "GGUF metadata audit 2026-10-22; qwen35moe architecture, context_length=262144, expert_count=256, expert_used_count=8; thinkingBudgets from qwen35moe/qwen35-tokenizer match with Qwen3.5-27B precedent",
+      "pricingNote": "Local: no cloud/API token charge ($0 token charge); still consumes electricity, GPU time, and VRAM"
+    },
+    "ollama/glm-5.3-flash": {
+      "localVsCloud": "cloud",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "toolSupport": true,
+      "reasoningModes": [
+        "Low",
+        "High",
+        "Max"
+      ],
+      "nativeReasoningDefault": "Max",
+      "recommendedRoutine": "High",
+      "recommendedHeavy": "Max",
+      "strengths": [
+        "agentic coding",
+        "long-context work",
+        "vision",
+        "tools",
+        "sustained multi-step coding",
+        "general high-value cloud work"
+      ],
+      "avoid": [
+        "not a reason to prefer over capable cheaper locals: it is a cloud escalation, not the routine first choice"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13; Preferred LionGateOS cloud generalist: strong capability, 1M context, multimodality, tools, low price.",
+      "pricing": {
+        "inputPerMTok": 0.15,
+        "cachedInputPerMTok": 0.03,
+        "outputPerMTok": 0.5,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Cheap"
+    },
+    "ollama/nemotron-3-super": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "On"
+      ],
+      "nativeReasoningDefault": "On",
+      "recommendedRoutine": "On",
+      "strengths": [
+        "agent workflows",
+        "multi-agent work",
+        "automation",
+        "large prompt workloads",
+        "cheap cloud reasoning"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13; Strong first cloud candidate when its capabilities fit.",
+      "pricing": {
+        "inputPerMTok": 0.015,
+        "cachedInputPerMTok": 0.015,
+        "outputPerMTok": 0.6,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Cheap"
+    },
+    "ollama/nemotron-3-nano:30b": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "On"
+      ],
+      "nativeReasoningDefault": "On",
+      "recommendedRoutine": "On",
+      "strengths": [
+        "lightweight agent jobs",
+        "inexpensive routine reasoning",
+        "simple cloud workloads"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.06,
+        "cachedInputPerMTok": null,
+        "outputPerMTok": 0.24,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Cheap"
+    },
+    "ollama/gpt-oss:20b": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Low",
+        "Medium",
+        "High"
+      ],
+      "nativeReasoningDefault": "Medium",
+      "recommendedRoutine": "Medium",
+      "recommendedHeavy": "High",
+      "strengths": [
+        "routine reasoning",
+        "tools",
+        "general developer work",
+        "inexpensive cloud fallback"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.07,
+        "cachedInputPerMTok": 0.035,
+        "outputPerMTok": 0.3,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Cheap"
+    },
+    "ollama/gemma4:31b": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "On"
+      ],
+      "nativeReasoningDefault": "Off",
+      "recommendedRoutine": "Off",
+      "recommendedHeavy": "On when reasoning is useful",
+      "strengths": [
+        "multimodal/vision work",
+        "inexpensive general cloud tasks"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.14,
+        "cachedInputPerMTok": 0.05,
+        "outputPerMTok": 0.4,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Cheap"
+    },
+    "ollama/gpt-oss:120b": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Low",
+        "Medium",
+        "High"
+      ],
+      "nativeReasoningDefault": "Medium",
+      "recommendedRoutine": "Medium",
+      "recommendedHeavy": "High",
+      "strengths": [
+        "stronger general reasoning",
+        "agentic tasks",
+        "developer work",
+        "tool use"
+      ],
+      "avoid": [
+        "unnecessary when GPT-OSS 20B suffices",
+        "unnecessary when an expensive frontier model is not needed"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.15,
+        "cachedInputPerMTok": 0.014,
+        "outputPerMTok": 0.6,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Cheap"
+    },
+    "ollama/deepseek-v4.1-flash": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "Low",
+        "High",
+        "Max"
+      ],
+      "nativeReasoningDefault": "High",
+      "recommendedRoutine": "High",
+      "recommendedHeavy": "Max",
+      "strengths": [
+        "strong reasoning",
+        "search/research",
+        "tool work",
+        "coding",
+        "large-context tasks"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13; off-peak rates: input $0.15, cached $0.003, output $0.60; Off-peak pricing makes this especially attractive when timing is flexible.",
+      "pricing": {
+        "inputPerMTok": 0.3,
+        "cachedInputPerMTok": 0.006,
+        "outputPerMTok": 1.2,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Cheap"
+    },
+    "ollama/minimax-m2.7": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "On"
+      ],
+      "nativeReasoningDefault": "On",
+      "recommendedRoutine": "On",
+      "strengths": [
+        "software engineering",
+        "agentic productivity",
+        "coding workflows"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.3,
+        "cachedInputPerMTok": 0.06,
+        "outputPerMTok": 1.2,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Cheap"
+    },
+    "ollama/mistral-large-3:675b": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [],
+      "reasoningNote": "No reasoning selector; recommended setting is as-is.",
+      "strengths": [
+        "general multimodal work",
+        "multilingual tasks",
+        "system-prompt-heavy workflows",
+        "tools"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.5,
+        "cachedInputPerMTok": null,
+        "outputPerMTok": 1.5,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Moderate"
+    },
+    "ollama/minimax-m3": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [],
+      "reasoningNote": "Reasoning selector none in the current Harness audit; recommended setting is as-is.",
+      "strengths": [
+        "large-context work",
+        "multimodal coding",
+        "agent workflows"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.6,
+        "cachedInputPerMTok": 0.12,
+        "outputPerMTok": 2.4,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Moderate"
+    },
+    "ollama/nemotron-3-ultra": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "On"
+      ],
+      "nativeReasoningDefault": "On",
+      "recommendedRoutine": "On",
+      "strengths": [
+        "complex agent workflows",
+        "long-running reasoning"
+      ],
+      "avoid": [
+        "output cost is materially higher than Nemotron Super; prefer Super when it can do the job equally well"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.1,
+        "cachedInputPerMTok": 0.1,
+        "outputPerMTok": 3.0,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Moderate"
+    },
+    "ollama/deepseek-v4-pro:0813": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "Low",
+        "High",
+        "Max"
+      ],
+      "nativeReasoningDefault": "Low",
+      "recommendedRoutine": "High",
+      "recommendedHeavy": "Max",
+      "strengths": [
+        "difficult reasoning beyond DeepSeek V4.1 Flash"
+      ],
+      "avoid": [
+        "do not use by default merely because it is the Pro model"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13; off-peak rates: input $0.66, cached $0.022, output $1.98",
+      "pricing": {
+        "inputPerMTok": 1.32,
+        "cachedInputPerMTok": 0.044,
+        "outputPerMTok": 3.96,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Expensive"
+    },
+    "ollama/glm-5.3": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Low",
+        "High",
+        "Max"
+      ],
+      "nativeReasoningDefault": "Max",
+      "recommendedRoutine": "High",
+      "recommendedHeavy": "Max",
+      "strengths": [
+        "high-end coding",
+        "difficult long-horizon agent work",
+        "tasks where GLM-5.3 Flash is demonstrably insufficient"
+      ],
+      "avoid": [
+        "prefer GLM-5.3 Flash first when quality is adequate"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 1.4,
+        "cachedInputPerMTok": 0.26,
+        "outputPerMTok": 4.4,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Expensive"
+    },
+    "ollama/glm-5.2": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "High",
+        "Max"
+      ],
+      "nativeReasoningDefault": "High",
+      "recommendedRoutine": "High",
+      "strengths": [
+        "only when GLM-5.2 has a task-specific advantage over the GLM-5.3 family"
+      ],
+      "avoid": [
+        "generally prefer the newer GLM-5.3 family"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 1.4,
+        "cachedInputPerMTok": 0.26,
+        "outputPerMTok": 4.4,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Expensive"
+    },
+    "ollama/kimi-k2.6": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "On"
+      ],
+      "nativeReasoningDefault": "On",
+      "recommendedRoutine": "On",
+      "strengths": [
+        "long-horizon coding",
+        "autonomous agents",
+        "difficult multimodal/agentic work"
+      ],
+      "avoid": [
+        "use only when cheaper models would materially compromise the result"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.95,
+        "cachedInputPerMTok": 0.16,
+        "outputPerMTok": 4.0,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Expensive"
+    },
+    "ollama/kimi-k2.7-code": {
+      "localVsCloud": "cloud",
+      "reasoningModes": [
+        "Off",
+        "On"
+      ],
+      "nativeReasoningDefault": "On",
+      "recommendedRoutine": "On",
+      "strengths": [
+        "difficult long-horizon software engineering",
+        "repository-scale coding",
+        "hard implementation/debugging tasks"
+      ],
+      "avoid": [
+        "do not use for routine coding that Qwen local, GLM-5.3 Flash, GPT-OSS, or another cheaper model can handle adequately"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 0.95,
+        "cachedInputPerMTok": 0.19,
+        "outputPerMTok": 4.0,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Expensive"
+    },
+    "ollama/kimi-k3": {
+      "localVsCloud": "cloud",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "toolSupport": true,
+      "reasoningModes": [
+        "Off",
+        "Low",
+        "High",
+        "Max"
+      ],
+      "nativeReasoningDefault": "Max",
+      "recommendedRoutine": "High",
+      "recommendedHeavy": "Max",
+      "strengths": [
+        "frontier-level multimodal agentic work",
+        "exceptionally difficult long-horizon engineering",
+        "tasks requiring its specific capability advantage"
+      ],
+      "avoid": [
+        "escalation model, not a routine default",
+        "output tokens cost ~25x GPT-OSS 120B output, ~30x GLM-5.3 Flash output, ~12.5x DeepSeek V4.1 Flash output"
+      ],
+      "evidence": "Ollama Cloud metadata reasoning audit 2026-10-13",
+      "pricing": {
+        "inputPerMTok": 3.0,
+        "cachedInputPerMTok": 0.3,
+        "outputPerMTok": 15.0,
+        "source": "https://ollama.com/pricing",
+        "verifiedAt": "2026-10-13"
+      },
+      "costTier": "Very Expensive"
+    }
+  }
+}
